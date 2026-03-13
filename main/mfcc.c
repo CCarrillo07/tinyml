@@ -3,101 +3,79 @@
 #include "mfcc.h"
 #include "esp_dsp.h"
 
-#define SAMPLE_RATE 16000
-#define MFCC_COEFFS 13
-
 static float fft_buffer[FRAME_SIZE * 2];
 static float power[FRAME_SIZE/2];
 static float mel_energy[MEL_FILTERS];
 static float mel_filterbank[MEL_FILTERS][FRAME_SIZE/2];
-static float dct_matrix[MFCC_COEFFS][MEL_FILTERS];
+static float dct_matrix[MFCC_COUNT][MEL_FILTERS];
 
 static int initialized = 0;
 
-static float hz_to_mel(float hz) {
-    return 2595.0f * log10f(1.0f + hz / 700.0f);
-}
-
-static float mel_to_hz(float mel) {
-    return 700.0f * (powf(10.0f, mel / 2595.0f) - 1.0f);
-}
+static float hz_to_mel(float hz) { return 2595.0f * log10f(1.0f + hz/700.0f); }
+static float mel_to_hz(float mel) { return 700.0f * (powf(10.0f, mel/2595.0f) - 1.0f); }
 
 static void init_mel_filterbank() {
     float mel_min = hz_to_mel(0);
-    float mel_max = hz_to_mel(SAMPLE_RATE / 2);
+    float mel_max = hz_to_mel(FRAME_SIZE/2);
+    float mel_points[MEL_FILTERS+2], hz_points[MEL_FILTERS+2];
+    int bin[MEL_FILTERS+2];
 
-    float mel_points[MEL_FILTERS + 2];
-    float hz_points[MEL_FILTERS + 2];
-    int bin[MEL_FILTERS + 2];
-
-    for (int i = 0; i < MEL_FILTERS + 2; i++) {
-        mel_points[i] = mel_min + (mel_max - mel_min) * i / (MEL_FILTERS + 1);
+    for (int i = 0; i < MEL_FILTERS+2; i++) {
+        mel_points[i] = mel_min + (mel_max - mel_min)*i/(MEL_FILTERS+1);
         hz_points[i] = mel_to_hz(mel_points[i]);
-        bin[i] = (int)((FRAME_SIZE + 1) * hz_points[i] / SAMPLE_RATE);
+        bin[i] = (int)((FRAME_SIZE+1) * hz_points[i]/FRAME_SIZE);
     }
 
-    memset(mel_filterbank, 0, sizeof(mel_filterbank));
+    memset(mel_filterbank,0,sizeof(mel_filterbank));
 
     for (int m = 1; m <= MEL_FILTERS; m++) {
-        int f_m_minus = bin[m - 1];
-        int f_m = bin[m];
-        int f_m_plus = bin[m + 1];
-
-        for (int k = f_m_minus; k < f_m && k < FRAME_SIZE/2; k++)
-            mel_filterbank[m-1][k] = (float)(k - f_m_minus) / (f_m - f_m_minus);
-
-        for (int k = f_m; k < f_m_plus && k < FRAME_SIZE/2; k++)
-            mel_filterbank[m-1][k] = (float)(f_m_plus - k) / (f_m_plus - f_m);
+        int f_m_minus = bin[m-1], f_m = bin[m], f_m_plus = bin[m+1];
+        for (int k=f_m_minus;k<f_m&&k<FRAME_SIZE/2;k++)
+            mel_filterbank[m-1][k]=(float)(k-f_m_minus)/(f_m-f_m_minus);
+        for (int k=f_m;k<f_m_plus&&k<FRAME_SIZE/2;k++)
+            mel_filterbank[m-1][k]=(float)(f_m_plus-k)/(f_m_plus-f_m);
     }
 }
 
 static void init_dct() {
-    for (int i = 0; i < MFCC_COEFFS; i++) {
-        for (int j = 0; j < MEL_FILTERS; j++) {
-            dct_matrix[i][j] =
-                cosf((float)i * (j + 0.5f) * M_PI / MEL_FILTERS) *
-                sqrtf(2.0f / MEL_FILTERS);
-        }
-    }
+    for(int i=0;i<MFCC_COUNT;i++)
+        for(int j=0;j<MEL_FILTERS;j++)
+            dct_matrix[i][j]=cosf(i*(j+0.5f)*M_PI/MEL_FILTERS)*sqrtf(2.0f/MEL_FILTERS);
 }
 
 static void mfcc_init() {
     if (initialized) return;
     init_mel_filterbank();
     init_dct();
-    initialized = 1;
+    initialized=1;
 }
 
-// <<< MODIFIED: sliding window of HOP_LENGTH
 void mfcc_compute(float *input, float *mfcc_out) {
     mfcc_init();
 
     for (int i = 0; i < FRAME_SIZE; i++) {
         fft_buffer[2*i] = input[i];
-        fft_buffer[2*i + 1] = 0.0f;
+        fft_buffer[2*i+1] = 0.0f;
     }
 
     dsps_fft2r_fc32(fft_buffer, FRAME_SIZE);
     dsps_bit_rev_fc32(fft_buffer, FRAME_SIZE);
     dsps_cplx2reC_fc32(fft_buffer, FRAME_SIZE);
 
-    for (int i = 0; i < FRAME_SIZE/2; i++) {
-        float real = fft_buffer[2*i];
-        float imag = fft_buffer[2*i+1];
-        power[i] = (real * real + imag * imag) / FRAME_SIZE;
+    for (int i=0;i<FRAME_SIZE/2;i++)
+        power[i]=(fft_buffer[2*i]*fft_buffer[2*i] + fft_buffer[2*i+1]*fft_buffer[2*i+1])/FRAME_SIZE;
+
+    memset(mel_energy,0,sizeof(mel_energy));
+
+    for(int m=0;m<MEL_FILTERS;m++){
+        for(int k=0;k<FRAME_SIZE/2;k++)
+            mel_energy[m]+=power[k]*mel_filterbank[m][k];
+        mel_energy[m]=logf(mel_energy[m]+1e-6f);
     }
 
-    memset(mel_energy, 0, sizeof(mel_energy));
-
-    for (int m = 0; m < MEL_FILTERS; m++) {
-        for (int k = 0; k < FRAME_SIZE/2; k++)
-            mel_energy[m] += power[k] * mel_filterbank[m][k];
-        mel_energy[m] = logf(mel_energy[m] + 1e-6f);
-    }
-
-    for (int i = 0; i < MFCC_COEFFS; i++) {
-        mfcc_out[i] = 0;
-        for (int j = 0; j < MEL_FILTERS; j++)
-            mfcc_out[i] += dct_matrix[i][j] * mel_energy[j];
+    for(int i=0;i<MFCC_COUNT;i++){
+        mfcc_out[i]=0;
+        for(int j=0;j<MEL_FILTERS;j++)
+            mfcc_out[i]+=dct_matrix[i][j]*mel_energy[j];
     }
 }

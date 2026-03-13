@@ -37,8 +37,6 @@ void audio_i2s_read(int16_t *buffer, int samples)
     size_t bytes_read;
     i2s_read(I2S_NUM, raw, samples * sizeof(int32_t), &bytes_read, portMAX_DELAY);
     int count = bytes_read / sizeof(int32_t);
-    for (int i = 0; i < count; i++) {
-        int32_t sample = raw[i] >> 8;
-        buffer[i] = sample >> 8;
-    }
+    for (int i = 0; i < count; i++)
+        buffer[i] = raw[i] >> 8;
 }

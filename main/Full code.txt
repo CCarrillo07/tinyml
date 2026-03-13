@@ -1,0 +1,637 @@
+##### Training code #######
+
+!pip install librosa numpy==1.26.4 datasets==2.18.0 scikit-learn
+import numpy as np
+import tensorflow as tf
+import librosa
+from datasets import load_dataset
+from sklearn.metrics import classification_report
+
+SAMPLE_RATE = 16000
+FRAME_SIZE = 512
+MFCC_COUNT = 13
+MEL_FILTERS = 26
+MAX_FRAMES = 100
+
+BATCH_SIZE = 32
+EPOCHS = 50
+
+dataset = load_dataset("google/speech_commands", "v0.02", trust_remote_code=True)
+
+COMMANDS = ["yes","no","on","off"]
+
+label_to_index = {cmd:i for i,cmd in enumerate(COMMANDS)}
+
+def filter_commands(example):
+    return labels[example["label"]] in COMMANDS
+
+dataset["train"] = dataset["train"].filter(filter_commands)
+dataset["validation"] = dataset["validation"].filter(filter_commands)
+dataset["test"] = dataset["test"].filter(filter_commands)
+
+NUM_CLASSES = len(COMMANDS)
+
+print("Classes:", COMMANDS)
+print("Number of Classes:", NUM_CLASSES)
+
+def preprocess(example):
+
+    audio = example["audio"]["array"]
+    sr = example["audio"]["sampling_rate"]
+
+    if sr != SAMPLE_RATE:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+
+    mfcc = librosa.feature.mfcc(
+        y=audio,
+        sr=SAMPLE_RATE,
+        n_mfcc=MFCC_COUNT,
+        n_fft=FRAME_SIZE,
+        hop_length=160,
+        n_mels=MEL_FILTERS
+    )
+
+    mfcc = mfcc.T
+
+    if mfcc.shape[0] < MAX_FRAMES:
+        pad = MAX_FRAMES - mfcc.shape[0]
+        mfcc = np.pad(mfcc, ((0,pad),(0,0)))
+    else:
+        mfcc = mfcc[:MAX_FRAMES]
+
+    mfcc = (mfcc - np.mean(mfcc)) / (np.std(mfcc) + 1e-6)
+
+    mfcc = np.expand_dims(mfcc, -1)
+
+    label_name = labels[example["label"]]
+    label = label_to_index[label_name]
+
+    return {
+        "audio": mfcc.astype(np.float32),
+        "label": label
+    }
+
+train_ds_hf = dataset["train"].map(preprocess, num_proc=4)
+val_ds_hf = dataset["validation"].map(preprocess, num_proc=4)
+test_ds_hf = dataset["test"].map(preprocess, num_proc=4)
+
+train_ds = train_ds_hf.to_tf_dataset(
+    columns=["audio"],
+    label_cols=["label"],
+    batch_size=BATCH_SIZE,
+    shuffle=True
+).prefetch(tf.data.AUTOTUNE)
+
+val_ds = val_ds_hf.to_tf_dataset(
+    columns=["audio"],
+    label_cols=["label"],
+    batch_size=BATCH_SIZE
+).prefetch(tf.data.AUTOTUNE)
+
+test_ds = test_ds_hf.to_tf_dataset(
+    columns=["audio"],
+    label_cols=["label"],
+    batch_size=BATCH_SIZE
+)
+
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(MAX_FRAMES, MFCC_COUNT, 1)),
+    tf.keras.layers.Conv2D(8, (3,3), activation="relu"),
+    tf.keras.layers.MaxPool2D((2,2)),
+    tf.keras.layers.Conv2D(16, (3,3), activation="relu"),
+    tf.keras.layers.MaxPool2D((2,2)),
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(32, activation="relu"),
+    tf.keras.layers.Dense(NUM_CLASSES, activation="softmax")
+])
+
+model.compile(
+    optimizer="adam",
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+model.summary()
+
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    monitor="val_loss",
+    patience=5,
+    restore_best_weights=True
+)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=[early_stopping]
+)
+
+predictions = []
+true_labels = []
+
+for X,y in test_ds:
+    pred = model.predict(X)
+    predictions.extend(np.argmax(pred,axis=1))
+    true_labels.extend(y.numpy())
+
+print(classification_report(true_labels,predictions,target_names=COMMANDS))
+
+precision    recall  f1-score   support
+
+         yes       0.96      0.97      0.97       419
+          no       0.93      0.94      0.94       405
+          on       0.90      0.91      0.90       396
+         off       0.91      0.89      0.90       402
+
+    accuracy                           0.93      1622
+   macro avg       0.93      0.93      0.93      1622
+weighted avg       0.93      0.93      0.93      1622
+
+def representative_dataset():
+    for X, _ in train_ds.take(100):
+        # <<< CHANGE: ensure 4D shape for TFLite int8 quantization
+        if X.ndim == 3:
+            X = np.expand_dims(X, -1)
+        yield [X]
+
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.representative_dataset = representative_dataset
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+
+# <<< CHANGE: input/output types set for INT8 quantization
+converter.inference_input_type = tf.uint8
+converter.inference_output_type = tf.uint8
+
+tflite_model = converter.convert()
+
+# Save TFLite model
+with open("speech_commands_mfcc.tflite", "wb") as f:
+    f.write(tflite_model)
+
+print("Quantized TFLite model saved: speech_commands_mfcc.tflite")
+
+########## Ops used by the tflite model #########
+
+CONV_2D
+FULLY_CONNECTED
+MAX_POOL_2D
+PACK
+QUANTIZE
+RESHAPE
+SHAPE
+SOFTMAX
+STRIDED_SLICE
+
+####### ESP32 code #########
+
+#### audio_i2s.c ####
+
+#include "audio_i2s.h"
+#include "driver/i2s.h"
+#include "freertos/FreeRTOS.h"
+
+#define I2S_NUM I2S_NUM_0
+#define FRAME_SIZE 512
+
+void audio_i2s_init(void)
+{
+    i2s_config_t config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S,
+        .intr_alloc_flags = 0,
+        .dma_buf_count = 4,
+        .dma_buf_len = 512,
+        .use_apll = false
+    };
+
+    i2s_pin_config_t pins = {
+        .bck_io_num = 4,
+        .ws_io_num = 5,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = 6
+    };
+
+    i2s_driver_install(I2S_NUM, &config, 0, NULL);
+    i2s_set_pin(I2S_NUM, &pins);
+    i2s_zero_dma_buffer(I2S_NUM);
+}
+
+void audio_i2s_read(int16_t *buffer, int samples)
+{
+    int32_t raw[samples];
+    size_t bytes_read;
+    i2s_read(I2S_NUM, raw, samples * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+    int count = bytes_read / sizeof(int32_t);
+    for (int i = 0; i < count; i++)
+        buffer[i] = raw[i] >> 8;
+}
+
+#### audio_i2s.h ####
+
+#pragma once
+#include <stdint.h>
+
+#define SAMPLE_RATE 16000
+
+void audio_i2s_init(void);
+void audio_i2s_read(int16_t *buffer, int samples);
+
+#### CMakeLists.txt ####
+
+idf_component_register(
+    SRCS "audio_i2s.c"
+    "constants.cc"
+    "main_functions.cc"
+    "main.c" 
+    "mfcc.c" 
+    "model.cc" 
+    "output_handler.cc"
+    INCLUDE_DIRS "."   
+    PRIV_REQUIRES driver freertos esp-dsp
+)
+
+#### constants.cc ####
+
+#include "constants.h"
+
+#### constants.h ####
+
+#ifndef CONSTANTS_H
+#define CONSTANTS_H
+
+// Example: number of inferences per cycle
+const int kInferencesPerCycle = 20;
+
+#endif // CONSTANTS_H
+
+#### idf_component.yml ####
+
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required IDF version
+  idf:
+    version: '>=4.1.0'
+  # # Put list of dependencies here
+  espressif/esp-dsp: '*'
+  espressif/esp-tflite-micro: '*'
+
+
+#### main.c ####
+
+#include <string.h> 
+#include "audio_i2s.h"
+#include "mfcc.h"
+#include "main_functions.h"
+#include <stdio.h>
+#include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#define FRAME_SIZE 512
+#define VAD_THRESHOLD 12000
+#define SILENCE_FRAMES_END 12
+#define MIN_SPEECH_FRAMES 6
+#define HOP_LENGTH 160
+
+static int16_t audio_buffer[FRAME_SIZE];
+static float audio_float[FRAME_SIZE];
+static float mfcc[MFCC_COUNT];
+static float sliding_buffer[FRAME_SIZE]={0};
+static int speech_active=0;
+static int silence_count=0;
+
+int detect_speech(int16_t *buffer){
+    long energy=0;
+    for(int i=0;i<FRAME_SIZE;i++) energy+=abs(buffer[i]);
+    energy/=FRAME_SIZE;
+
+    static int speech_frames=0;
+    if(energy>VAD_THRESHOLD) speech_frames++;
+    else speech_frames=0;
+    return speech_frames>2;
+}
+
+void app_main(void){
+    setup();
+    audio_i2s_init();
+
+    while(1){
+        audio_i2s_read(audio_buffer, FRAME_SIZE);
+        int speech=detect_speech(audio_buffer);
+
+        if(speech){
+            speech_active=1;
+            silence_count=0;
+            for(int i=0;i<FRAME_SIZE;i++) audio_float[i]=(float)audio_buffer[i];
+
+            for(int i=0;i<=FRAME_SIZE-HOP_LENGTH;i+=HOP_LENGTH){
+                for(int j=0;j<HOP_LENGTH;j++){
+                    memmove(sliding_buffer,sliding_buffer+1,(FRAME_SIZE-1)*sizeof(float));
+                    sliding_buffer[FRAME_SIZE-1]=audio_float[i+j];
+                }
+                mfcc_compute(sliding_buffer, mfcc);
+                loop(mfcc);
+            }
+        } else {
+            if(speech_active){
+                silence_count++;
+                if(silence_count>SILENCE_FRAMES_END){
+                    int frames=get_frame_count();
+                    if(frames>=MIN_SPEECH_FRAMES){
+                        run_inference_on_speech();
+                    }
+                    reset_mfcc_buffer();
+                    speech_active=0;
+                    silence_count=0;
+                }
+            }
+        }
+        vTaskDelay(1);
+    }
+}
+
+#### main_functions.cc ####
+
+#include "main_functions.h"
+#include "model.h"
+#include "output_handler.h"
+#include "mfcc.h"
+
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+#include <string.h>
+#include <math.h>
+#include "esp_log.h"
+
+static const char* TAG = "TinyML";
+
+namespace {
+
+const tflite::Model* model = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* input = nullptr;
+TfLiteTensor* output = nullptr;
+
+constexpr int kTensorArenaSize = 40*1024;
+uint8_t tensor_arena[kTensorArenaSize];
+
+float mfcc_buffer[MAX_FRAMES][MFCC_COUNT];
+int frame_index = 0;
+
+}
+
+void setup() {
+    model = tflite::GetModel(g_model);
+
+    static tflite::MicroMutableOpResolver<10> resolver;
+    resolver.AddConv2D();
+    resolver.AddFullyConnected();
+    resolver.AddMaxPool2D();
+    resolver.AddPack();
+    resolver.AddQuantize();
+    resolver.AddReshape();
+    resolver.AddShape();
+    resolver.AddSoftmax();
+    resolver.AddStridedSlice();
+
+    static tflite::MicroInterpreter static_interpreter(model,resolver,tensor_arena,kTensorArenaSize);
+    interpreter = &static_interpreter;
+    interpreter->AllocateTensors();
+    input = interpreter->input(0);
+    output = interpreter->output(0);
+
+    memset(mfcc_buffer,0,sizeof(mfcc_buffer));
+    frame_index=0;
+}
+
+void loop(float* mfcc) {
+    if(frame_index<MAX_FRAMES){
+        memcpy(mfcc_buffer[frame_index], mfcc, sizeof(float)*MFCC_COUNT);
+        frame_index++;
+    }
+}
+
+extern "C" void run_inference_on_speech() {
+    if(frame_index==0) return;
+
+    float mean=0,std=0,sum=0,sq_sum=0;
+    for(int i=0;i<frame_index;i++)
+        for(int j=0;j<MFCC_COUNT;j++){
+            sum+=mfcc_buffer[i][j];
+            sq_sum+=mfcc_buffer[i][j]*mfcc_buffer[i][j];
+        }
+    mean=sum/(frame_index*MFCC_COUNT);
+    std=sqrtf(sq_sum/(frame_index*MFCC_COUNT)-mean*mean);
+    if(std<1e-6f) std=1e-6f;
+
+    int offset=(MAX_FRAMES-frame_index)/2;
+
+    for(int i=0;i<MAX_FRAMES;i++)
+        for(int j=0;j<MFCC_COUNT;j++){
+            float value=0;
+            int src=i-offset;
+            if(src>=0 && src<frame_index) value=mfcc_buffer[src][j];
+            float normalized=(value-mean)/std;
+            int32_t scaled=(int32_t)(normalized/input->params.scale+input->params.zero_point);
+            if(scaled<0) scaled=0;
+            if(scaled>255) scaled=255;
+            input->data.uint8[i*MFCC_COUNT+j]=(uint8_t)scaled;
+        }
+
+    if(interpreter->Invoke()==kTfLiteOk){
+        int count=output->dims->data[1];
+        float scores[count];
+        for(int i=0;i<count;i++)
+            scores[i]=(output->data.uint8[i]-output->params.zero_point)*output->params.scale;
+        HandleOutput(scores,count);
+    }
+    memset(mfcc_buffer,0,sizeof(mfcc_buffer));
+    frame_index=0;
+}
+
+extern "C" void reset_mfcc_buffer() { memset(mfcc_buffer,0,sizeof(mfcc_buffer)); frame_index=0; }
+extern "C" int get_frame_count() { return frame_index; }
+
+#### main_functions.h ####
+
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void setup();
+void loop(float* mfcc);
+void reset_mfcc_buffer();
+void run_inference_on_speech();
+int get_frame_count();
+
+#ifdef __cplusplus
+}
+#endif
+
+#### mfcc.c ####
+
+#include <math.h>
+#include <string.h>
+#include "mfcc.h"
+#include "esp_dsp.h"
+
+static float fft_buffer[FRAME_SIZE * 2];
+static float power[FRAME_SIZE/2];
+static float mel_energy[MEL_FILTERS];
+static float mel_filterbank[MEL_FILTERS][FRAME_SIZE/2];
+static float dct_matrix[MFCC_COUNT][MEL_FILTERS];
+
+static int initialized = 0;
+
+static float hz_to_mel(float hz) { return 2595.0f * log10f(1.0f + hz/700.0f); }
+static float mel_to_hz(float mel) { return 700.0f * (powf(10.0f, mel/2595.0f) - 1.0f); }
+
+static void init_mel_filterbank() {
+    float mel_min = hz_to_mel(0);
+    float mel_max = hz_to_mel(FRAME_SIZE/2);
+    float mel_points[MEL_FILTERS+2], hz_points[MEL_FILTERS+2];
+    int bin[MEL_FILTERS+2];
+
+    for (int i = 0; i < MEL_FILTERS+2; i++) {
+        mel_points[i] = mel_min + (mel_max - mel_min)*i/(MEL_FILTERS+1);
+        hz_points[i] = mel_to_hz(mel_points[i]);
+        bin[i] = (int)((FRAME_SIZE+1) * hz_points[i]/FRAME_SIZE);
+    }
+
+    memset(mel_filterbank,0,sizeof(mel_filterbank));
+
+    for (int m = 1; m <= MEL_FILTERS; m++) {
+        int f_m_minus = bin[m-1], f_m = bin[m], f_m_plus = bin[m+1];
+        for (int k=f_m_minus;k<f_m&&k<FRAME_SIZE/2;k++)
+            mel_filterbank[m-1][k]=(float)(k-f_m_minus)/(f_m-f_m_minus);
+        for (int k=f_m;k<f_m_plus&&k<FRAME_SIZE/2;k++)
+            mel_filterbank[m-1][k]=(float)(f_m_plus-k)/(f_m_plus-f_m);
+    }
+}
+
+static void init_dct() {
+    for(int i=0;i<MFCC_COUNT;i++)
+        for(int j=0;j<MEL_FILTERS;j++)
+            dct_matrix[i][j]=cosf(i*(j+0.5f)*M_PI/MEL_FILTERS)*sqrtf(2.0f/MEL_FILTERS);
+}
+
+static void mfcc_init() {
+    if (initialized) return;
+    init_mel_filterbank();
+    init_dct();
+    initialized=1;
+}
+
+void mfcc_compute(float *input, float *mfcc_out) {
+    mfcc_init();
+
+    for (int i = 0; i < FRAME_SIZE; i++) {
+        fft_buffer[2*i] = input[i];
+        fft_buffer[2*i+1] = 0.0f;
+    }
+
+    dsps_fft2r_fc32(fft_buffer, FRAME_SIZE);
+    dsps_bit_rev_fc32(fft_buffer, FRAME_SIZE);
+    dsps_cplx2reC_fc32(fft_buffer, FRAME_SIZE);
+
+    for (int i=0;i<FRAME_SIZE/2;i++)
+        power[i]=(fft_buffer[2*i]*fft_buffer[2*i] + fft_buffer[2*i+1]*fft_buffer[2*i+1])/FRAME_SIZE;
+
+    memset(mel_energy,0,sizeof(mel_energy));
+
+    for(int m=0;m<MEL_FILTERS;m++){
+        for(int k=0;k<FRAME_SIZE/2;k++)
+            mel_energy[m]+=power[k]*mel_filterbank[m][k];
+        mel_energy[m]=logf(mel_energy[m]+1e-6f);
+    }
+
+    for(int i=0;i<MFCC_COUNT;i++){
+        mfcc_out[i]=0;
+        for(int j=0;j<MEL_FILTERS;j++)
+            mfcc_out[i]+=dct_matrix[i][j]*mel_energy[j];
+    }
+}
+
+#### mfcc.h ####
+
+#pragma once
+
+#define FRAME_SIZE 512
+#define HOP_LENGTH 160
+#define MFCC_COUNT 13
+#define MEL_FILTERS 26
+#define MAX_FRAMES 100
+
+void mfcc_compute(float *audio, float *mfcc_out);
+
+#### model.cc ####
+
+#include "model.h"
+
+const unsigned char g_model[] = {
+  0x20, 0x00, 0x00, 0x00, 0x54, 0x46, 0x4c, 0x33, 0x00, 0x00, 0x00, 0x00,
+  ...
+  0x00, 0x00, 0x00, 0x72
+};
+const int g_model_len = 19744;
+
+#### model.h ####
+
+#pragma once
+extern const unsigned char g_model[];
+extern const int g_model_len;
+
+#### output_handler.cc ####
+
+#include <stdio.h>
+#include "output_handler.h"
+#include "tensorflow/lite/micro/micro_log.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+const char* kLabels[] = {
+    "yes","no","on","off"
+};
+
+void HandleOutput(float* scores, int count) {
+
+    MicroPrintf("---- Prediction ----");
+
+    for (int i = 0; i < count; i++) {
+        MicroPrintf("%s: %.2f", kLabels[i], scores[i]);
+    }
+
+    MicroPrintf("-------------------");
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#### output_handler.h ####
+
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void HandleOutput(float* scores, int count);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+### Output ###
+
