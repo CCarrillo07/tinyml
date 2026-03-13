@@ -1,90 +1,99 @@
-#include "audio_i2s.h"
-#include "mfcc.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <math.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include "audio_i2s.h"
+#include "mfcc.h"
 #include "main_functions.h"
 
-#include <math.h>
-#include <stdio.h>
-#include <string.h>
+#define FRAME_SIZE 512
 
-#define VAD_THRESHOLD 1200
-#define VAD_SILENCE_FRAMES 60
+// FIX #1: Lower VAD threshold
+#define VAD_THRESHOLD 600
 
-#define HOP_LENGTH 160
+#define SILENCE_FRAMES_END 12
 
-static int16_t audio_window[FRAME_SIZE];
-static int16_t audio_buffer[HOP_LENGTH];
+static int16_t audio_buffer[FRAME_SIZE];
+static float audio_float[FRAME_SIZE];
+static float mfcc[MFCC_COUNT];
 
-float mfcc[MFCC_COUNT];
+static int speech_active = 0;
+static int silence_count = 0;
 
-static int silence_counter = 0;
-static int recording = 0;
+
+// FIX #2: Add energy debug printing
+static int detect_speech(int16_t *buffer)
+{
+    long energy = 0;
+
+    for (int i = 0; i < FRAME_SIZE; i++)
+        energy += abs(buffer[i]);
+
+    energy /= FRAME_SIZE;
+
+    // Debug print to tune threshold
+    //printf("Energy: %ld\n", energy);
+
+    static int speech_frames = 0;
+
+    if (energy > VAD_THRESHOLD)
+    {
+        speech_frames++;
+    }
+    else
+    {
+        speech_frames = 0;
+    }
+
+    return speech_frames > 2;
+}
 
 void app_main(void)
 {
-    audio_i2s_init();
     setup();
-
-    memset(audio_window, 0, sizeof(audio_window));
+    audio_i2s_init();
 
     while (1)
     {
-        audio_i2s_read(audio_buffer, HOP_LENGTH);
+        audio_i2s_read(audio_buffer, FRAME_SIZE);
 
-        int energy = 0;
+        int speech = detect_speech(audio_buffer);
 
-        for (int i = 0; i < HOP_LENGTH; i++)
+        if (speech)
         {
-            energy += abs(audio_buffer[i]);
-        }
+            speech_active = 1;
+            silence_count = 0;
 
-        energy /= HOP_LENGTH;
+            for (int i = 0; i < FRAME_SIZE; i++)
+                audio_float[i] = (float)audio_buffer[i];
 
-        if (!recording)
-        {
-            if (energy > VAD_THRESHOLD)
-            {
-                printf("\nSpeech detected\n");
+            mfcc_compute(audio_float, mfcc);
 
-                recording = 1;
-                silence_counter = 0;
-            }
+            loop(mfcc);
         }
         else
         {
-            /* sliding window */
-
-            memmove(
-                audio_window,
-                audio_window + HOP_LENGTH,
-                (FRAME_SIZE - HOP_LENGTH) * sizeof(int16_t)
-            );
-
-            memcpy(
-                audio_window + (FRAME_SIZE - HOP_LENGTH),
-                audio_buffer,
-                HOP_LENGTH * sizeof(int16_t)
-            );
-
-            mfcc_compute(audio_window, mfcc);
-
-            loop();
-
-            if (energy < VAD_THRESHOLD)
-                silence_counter++;
-            else
-                silence_counter = 0;
-
-            if (silence_counter > VAD_SILENCE_FRAMES)
+            if (speech_active)
             {
-                printf("Speech finished\n\n");
+                silence_count++;
 
-                recording = 0;
-                silence_counter = 0;
+                if (silence_count > SILENCE_FRAMES_END)
+                {
+                    // FIX #3: Debug print when inference starts
+                    printf("Running inference...\n");
 
-                reset_mfcc_buffer();
+                    run_inference_on_speech();
+                    reset_mfcc_buffer();
+
+                    speech_active = 0;
+                    silence_count = 0;
+                }
             }
         }
+
+        vTaskDelay(1);
     }
 }

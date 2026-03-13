@@ -4,10 +4,6 @@
 #define FRAME_SIZE 512
 #define MFCC_COUNT 13
 #define MEL_FILTERS 26
+#define MAX_FRAMES 100
 
-/* Match training */
-#define MAX_FRAMES 49
-
-extern float mfcc[MFCC_COUNT];
-
-void mfcc_compute(int16_t *audio, float *mfcc_out);
+void mfcc_compute(float *audio, float *mfcc_out);

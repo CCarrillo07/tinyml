@@ -7,8 +7,7 @@ extern "C" {
 #endif
 
 const char* kLabels[] = {
-    "yes","no","up","down","left",
-    "right","on","off","stop","go"
+    "yes","no","on","off"
 };
 
 void HandleOutput(float* scores, int count) {

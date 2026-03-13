@@ -9,7 +9,11 @@
 #include "tensorflow/lite/micro/system_setup.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
+#include "esp_log.h"
 #include <string.h>
+#include <math.h>
+
+static const char* TAG = "TinyML";
 
 namespace {
 
@@ -24,43 +28,32 @@ uint8_t tensor_arena[kTensorArenaSize];
 float mfcc_buffer[MAX_FRAMES][MFCC_COUNT];
 int frame_index = 0;
 
-}  
+}
 
 void setup()
 {
+    esp_log_level_set("*", ESP_LOG_INFO);
+
     model = tflite::GetModel(g_model);
 
-    if (model->version() != TFLITE_SCHEMA_VERSION) {
-        MicroPrintf("Model schema %d not supported", model->version());
-        return;
-    }
-
     static tflite::MicroMutableOpResolver<10> resolver;
-
     resolver.AddConv2D();
-    resolver.AddDepthwiseConv2D();
     resolver.AddFullyConnected();
-    resolver.AddSoftmax();
-    resolver.AddReshape();
-    resolver.AddQuantize();
-    resolver.AddDequantize();
     resolver.AddMaxPool2D();
-    resolver.AddAveragePool2D();
-    resolver.AddRelu();
+    resolver.AddPack();
+    resolver.AddQuantize();
+    resolver.AddReshape();
+    resolver.AddShape();
+    resolver.AddSoftmax();
+    resolver.AddStridedSlice();
 
     static tflite::MicroInterpreter static_interpreter(
-        model,
-        resolver,
-        tensor_arena,
-        kTensorArenaSize
+        model, resolver, tensor_arena, kTensorArenaSize
     );
 
     interpreter = &static_interpreter;
 
-    if (interpreter->AllocateTensors() != kTfLiteOk) {
-        MicroPrintf("AllocateTensors failed");
-        return;
-    }
+    interpreter->AllocateTensors();
 
     input = interpreter->input(0);
     output = interpreter->output(0);
@@ -69,78 +62,70 @@ void setup()
     frame_index = 0;
 }
 
-void loop()
+void loop(float* mfcc)
 {
     if (frame_index < MAX_FRAMES)
     {
-        memcpy(
-            mfcc_buffer[frame_index],
-            mfcc,
-            sizeof(float) * MFCC_COUNT
-        );
-
+        memcpy(mfcc_buffer[frame_index], mfcc, sizeof(float) * MFCC_COUNT);
         frame_index++;
     }
+}
 
-    if (frame_index >= MAX_FRAMES)
+extern "C" void run_inference_on_speech()
+{
+    if (frame_index == 0) return;
+
+    float sum = 0.0f;
+    float sq_sum = 0.0f;
+
+    for (int i = 0; i < frame_index; i++)
+        for (int j = 0; j < MFCC_COUNT; j++)
+        {
+            sum += mfcc_buffer[i][j];
+            sq_sum += mfcc_buffer[i][j] * mfcc_buffer[i][j];
+        }
+
+    float mean = sum / (frame_index * MFCC_COUNT);
+    float std = sqrtf((sq_sum / (frame_index * MFCC_COUNT)) - (mean * mean));
+    if (std < 1e-6f) std = 1e-6f;
+
+    int offset = (MAX_FRAMES - frame_index) / 2;
+
+    for (int i = 0; i < MAX_FRAMES; i++)
+    for (int j = 0; j < MFCC_COUNT; j++)
     {
-        float mfcc_min = mfcc_buffer[0][0];
-        float mfcc_max = mfcc_buffer[0][0];
+        float value = 0.0f;
 
-        for (int i = 0; i < MAX_FRAMES; i++)
-        {
-            for (int j = 0; j < MFCC_COUNT; j++)
-            {
-                if (mfcc_buffer[i][j] < mfcc_min)
-                    mfcc_min = mfcc_buffer[i][j];
+        int src = i - offset;
 
-                if (mfcc_buffer[i][j] > mfcc_max)
-                    mfcc_max = mfcc_buffer[i][j];
-            }
-        }
+        if (src >= 0 && src < frame_index)
+            value = mfcc_buffer[src][j];
 
-        float range = mfcc_max - mfcc_min;
-        if (range < 1e-6f) range = 1.0f;
+        int32_t scaled =
+            (int32_t)(((value - mean)/std) / input->params.scale
+            + input->params.zero_point);
 
-        for (int i = 0; i < MAX_FRAMES; i++)
-        {
-            for (int j = 0; j < MFCC_COUNT; j++)
-            {
-                float normalized =
-                    (mfcc_buffer[i][j] - mfcc_min) / range * 255.0f;
+        if (scaled < 0) scaled = 0;
+        if (scaled > 255) scaled = 255;
 
-                int32_t scaled =
-                    (int32_t)(normalized / input->params.scale +
-                              input->params.zero_point);
-
-                if (scaled < 0) scaled = 0;
-                if (scaled > 255) scaled = 255;
-
-                input->data.uint8[i * MFCC_COUNT + j] =
-                    (uint8_t)scaled;
-            }
-        }
-
-        if (interpreter->Invoke() == kTfLiteOk)
-        {
-            int count = output->dims->data[1];
-            float scores[count];
-
-            for (int i = 0; i < count; i++)
-            {
-                scores[i] =
-                    (output->data.uint8[i] -
-                     output->params.zero_point) *
-                    output->params.scale;
-            }
-
-            HandleOutput(scores, count);
-        }
-
-        // only ONE inference
-        memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
-        frame_index = 0;
+        input->data.uint8[i * MFCC_COUNT + j] = (uint8_t)scaled;
     }
+
+    if (interpreter->Invoke() == kTfLiteOk)
+    {
+        int count = output->dims->data[1];
+        float scores[count];
+
+        for (int i = 0; i < count; i++)
+            scores[i] =
+                (output->data.uint8[i] - output->params.zero_point)
+                * output->params.scale;
+
+        HandleOutput(scores, count);
+    }
+
+    memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
+    frame_index = 0;
 }
 
 extern "C" void reset_mfcc_buffer()

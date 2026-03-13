@@ -5,8 +5,9 @@ extern "C" {
 #endif
 
 void setup();
-void loop();
+void loop(float* mfcc);
 void reset_mfcc_buffer();
+void run_inference_on_speech();
 
 #ifdef __cplusplus
 }
