@@ -9,6 +9,9 @@ void loop(float* mfcc);
 void reset_mfcc_buffer();
 void run_inference_on_speech();
 
+// NEW: expose frame count to main.c
+int get_frame_count();
+
 #ifdef __cplusplus
 }
 #endif

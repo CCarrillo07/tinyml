@@ -1,7 +1,8 @@
+#include <string.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
-
+     
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -16,13 +17,20 @@
 
 #define SILENCE_FRAMES_END 12
 
+// NEW: Require minimum frames before inference
+#define MIN_SPEECH_FRAMES 6
+
+#define HOP_LENGTH 160    // <<< define hop length used in sliding buffer
+
 static int16_t audio_buffer[FRAME_SIZE];
 static float audio_float[FRAME_SIZE];
 static float mfcc[MFCC_COUNT];
 
+// Sliding buffer for MFCC computation
+static float sliding_buffer[FRAME_SIZE] = {0};
+
 static int speech_active = 0;
 static int silence_count = 0;
-
 
 // FIX #2: Add energy debug printing
 static int detect_speech(int16_t *buffer)
@@ -58,6 +66,7 @@ void app_main(void)
 
     while (1)
     {
+        // Read new audio samples
         audio_i2s_read(audio_buffer, FRAME_SIZE);
 
         int speech = detect_speech(audio_buffer);
@@ -67,12 +76,26 @@ void app_main(void)
             speech_active = 1;
             silence_count = 0;
 
+            // Convert int16 to float
             for (int i = 0; i < FRAME_SIZE; i++)
                 audio_float[i] = (float)audio_buffer[i];
 
-            mfcc_compute(audio_float, mfcc);
+            // <<< UPDATED: slide buffer in HOP_LENGTH steps
+            for (int i = 0; i <= FRAME_SIZE - HOP_LENGTH; i += HOP_LENGTH)
+            {
+                // Slide the buffer by HOP_LENGTH samples
+                for (int j = 0; j < HOP_LENGTH; j++)
+                {
+                    memmove(sliding_buffer, sliding_buffer + 1, (FRAME_SIZE - 1) * sizeof(float));
+                    sliding_buffer[FRAME_SIZE - 1] = audio_float[i + j];
+                }
 
-            loop(mfcc);
+                // Compute MFCC for this hop
+                mfcc_compute(sliding_buffer, mfcc);
+
+                // Store MFCC frame
+                loop(mfcc);
+            }
         }
         else
         {
@@ -80,14 +103,22 @@ void app_main(void)
             {
                 silence_count++;
 
+                // If enough silent frames, run inference
                 if (silence_count > SILENCE_FRAMES_END)
                 {
-                    // FIX #3: Debug print when inference starts
-                    printf("Running inference...\n");
+                    int frames = get_frame_count();
 
-                    run_inference_on_speech();
+                    if (frames >= MIN_SPEECH_FRAMES)
+                    {
+                        printf("Running inference...\n");
+                        run_inference_on_speech();
+                    }
+                    else
+                    {
+                        printf("Speech too short (%d frames)\n", frames);
+                    }
+
                     reset_mfcc_buffer();
-
                     speech_active = 0;
                     silence_count = 0;
                 }
