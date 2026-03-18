@@ -60,41 +60,40 @@ void loop(float* mfcc) {
 }
 
 extern "C" void run_inference_on_speech() {
-    if(frame_index==0) return;
+    if(frame_index == 0) return;
 
-    float mean=0,std=0,sum=0,sq_sum=0;
-    for(int i=0;i<frame_index;i++)
-        for(int j=0;j<MFCC_COUNT;j++){
-            sum+=mfcc_buffer[i][j];
-            sq_sum+=mfcc_buffer[i][j]*mfcc_buffer[i][j];
+    // Ensure MAX_FRAMES x MFCC_COUNT buffer is filled
+    int offset = (MAX_FRAMES - frame_index) / 2;
+
+    for(int i = 0; i < MAX_FRAMES; i++) {
+        for(int j = 0; j < MFCC_COUNT; j++) {
+            float value = 0.0f;
+            int src = i - offset;
+            if(src >= 0 && src < frame_index) value = mfcc_buffer[src][j];
+
+            // Quantize using input tensor params
+            int32_t scaled = (int32_t)(value / input->params.scale + input->params.zero_point);
+            if(scaled < 0) scaled = 0;
+            if(scaled > 255) scaled = 255;
+
+            input->data.uint8[i * MFCC_COUNT + j] = (uint8_t)scaled;
         }
-    mean=sum/(frame_index*MFCC_COUNT);
-    std=sqrtf(sq_sum/(frame_index*MFCC_COUNT)-mean*mean);
-    if(std<1e-6f) std=1e-6f;
-
-    int offset=(MAX_FRAMES-frame_index)/2;
-
-    for(int i=0;i<MAX_FRAMES;i++)
-        for(int j=0;j<MFCC_COUNT;j++){
-            float value=0;
-            int src=i-offset;
-            if(src>=0 && src<frame_index) value=mfcc_buffer[src][j];
-            float normalized=(value-mean)/std;
-            int32_t scaled=(int32_t)(normalized/input->params.scale+input->params.zero_point);
-            if(scaled<0) scaled=0;
-            if(scaled>255) scaled=255;
-            input->data.uint8[i*MFCC_COUNT+j]=(uint8_t)scaled;
-        }
-
-    if(interpreter->Invoke()==kTfLiteOk){
-        int count=output->dims->data[1];
-        float scores[count];
-        for(int i=0;i<count;i++)
-            scores[i]=(output->data.uint8[i]-output->params.zero_point)*output->params.scale;
-        HandleOutput(scores,count);
     }
-    memset(mfcc_buffer,0,sizeof(mfcc_buffer));
-    frame_index=0;
+
+    // Run inference
+    if(interpreter->Invoke() == kTfLiteOk) {
+        int count = output->dims->data[1];
+        float scores[count];
+
+        for(int i = 0; i < count; i++)
+            scores[i] = (output->data.uint8[i] - output->params.zero_point) * output->params.scale;
+
+        HandleOutput(scores, count);
+    }
+
+    // Reset buffer
+    memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
+    frame_index = 0;
 }
 
 extern "C" void reset_mfcc_buffer() { memset(mfcc_buffer,0,sizeof(mfcc_buffer)); frame_index=0; }
