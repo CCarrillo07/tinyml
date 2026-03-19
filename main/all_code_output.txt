@@ -1,12 +1,11 @@
-##### Training code #######
 
+############# TRAINING CODE #############
 !pip install librosa numpy==1.26.4 datasets==2.18.0 scikit-learn
 import numpy as np
 import tensorflow as tf
 import librosa
 from datasets import load_dataset
 from sklearn.metrics import classification_report
-
 SAMPLE_RATE = 16000
 FRAME_SIZE = 512
 MFCC_COUNT = 13
@@ -18,7 +17,7 @@ EPOCHS = 50
 
 dataset = load_dataset("google/speech_commands", "v0.02", trust_remote_code=True)
 
-COMMANDS = ["yes","no","on","off"]
+COMMANDS = ["yes","no","on","off","up","down","left","right","stop","go"]
 
 label_to_index = {cmd:i for i,cmd in enumerate(COMMANDS)}
 
@@ -126,6 +125,11 @@ history = model.fit(
     callbacks=[early_stopping]
 )
 
+results = model.evaluate(test_ds)
+print("Test accuracy:", results[1])
+
+Test accuracy: 0.8082965016365051
+
 predictions = []
 true_labels = []
 
@@ -138,14 +142,20 @@ print(classification_report(true_labels,predictions,target_names=COMMANDS))
 
 precision    recall  f1-score   support
 
-         yes       0.96      0.97      0.97       419
-          no       0.93      0.94      0.94       405
-          on       0.90      0.91      0.90       396
-         off       0.91      0.89      0.90       402
+         yes       0.89      0.92      0.91       419
+          no       0.79      0.74      0.76       405
+          on       0.85      0.82      0.83       396
+         off       0.82      0.79      0.80       402
+          up       0.79      0.75      0.77       425
+        down       0.72      0.81      0.76       406
+        left       0.76      0.78      0.77       412
+       right       0.85      0.88      0.86       396
+        stop       0.93      0.91      0.92       411
+          go       0.71      0.68      0.70       402
 
-    accuracy                           0.93      1622
-   macro avg       0.93      0.93      0.93      1622
-weighted avg       0.93      0.93      0.93      1622
+    accuracy                           0.81      4074
+   macro avg       0.81      0.81      0.81      4074
+weighted avg       0.81      0.81      0.81      4074
 
 def representative_dataset():
     for X, _ in train_ds.take(100):
@@ -171,19 +181,7 @@ with open("speech_commands_mfcc.tflite", "wb") as f:
 
 print("Quantized TFLite model saved: speech_commands_mfcc.tflite")
 
-########## Ops used by the tflite model #########
-
-CONV_2D
-FULLY_CONNECTED
-MAX_POOL_2D
-PACK
-QUANTIZE
-RESHAPE
-SHAPE
-SOFTMAX
-STRIDED_SLICE
-
-####### ESP32 code #########
+############# ESP32 CODE #############
 
 #### audio_i2s.c ####
 
@@ -282,7 +280,7 @@ dependencies:
 
 #### main.c ####
 
-#include <string.h> 
+#include <string.h>    
 #include "audio_i2s.h"
 #include "mfcc.h"
 #include "main_functions.h"
@@ -418,41 +416,40 @@ void loop(float* mfcc) {
 }
 
 extern "C" void run_inference_on_speech() {
-    if(frame_index==0) return;
+    if(frame_index == 0) return;
 
-    float mean=0,std=0,sum=0,sq_sum=0;
-    for(int i=0;i<frame_index;i++)
-        for(int j=0;j<MFCC_COUNT;j++){
-            sum+=mfcc_buffer[i][j];
-            sq_sum+=mfcc_buffer[i][j]*mfcc_buffer[i][j];
+    // Ensure MAX_FRAMES x MFCC_COUNT buffer is filled
+    int offset = (MAX_FRAMES - frame_index) / 2;
+
+    for(int i = 0; i < MAX_FRAMES; i++) {
+        for(int j = 0; j < MFCC_COUNT; j++) {
+            float value = 0.0f;
+            int src = i - offset;
+            if(src >= 0 && src < frame_index) value = mfcc_buffer[src][j];
+
+            // Quantize using input tensor params
+            int32_t scaled = (int32_t)(value / input->params.scale + input->params.zero_point);
+            if(scaled < 0) scaled = 0;
+            if(scaled > 255) scaled = 255;
+
+            input->data.uint8[i * MFCC_COUNT + j] = (uint8_t)scaled;
         }
-    mean=sum/(frame_index*MFCC_COUNT);
-    std=sqrtf(sq_sum/(frame_index*MFCC_COUNT)-mean*mean);
-    if(std<1e-6f) std=1e-6f;
-
-    int offset=(MAX_FRAMES-frame_index)/2;
-
-    for(int i=0;i<MAX_FRAMES;i++)
-        for(int j=0;j<MFCC_COUNT;j++){
-            float value=0;
-            int src=i-offset;
-            if(src>=0 && src<frame_index) value=mfcc_buffer[src][j];
-            float normalized=(value-mean)/std;
-            int32_t scaled=(int32_t)(normalized/input->params.scale+input->params.zero_point);
-            if(scaled<0) scaled=0;
-            if(scaled>255) scaled=255;
-            input->data.uint8[i*MFCC_COUNT+j]=(uint8_t)scaled;
-        }
-
-    if(interpreter->Invoke()==kTfLiteOk){
-        int count=output->dims->data[1];
-        float scores[count];
-        for(int i=0;i<count;i++)
-            scores[i]=(output->data.uint8[i]-output->params.zero_point)*output->params.scale;
-        HandleOutput(scores,count);
     }
-    memset(mfcc_buffer,0,sizeof(mfcc_buffer));
-    frame_index=0;
+
+    // Run inference
+    if(interpreter->Invoke() == kTfLiteOk) {
+        int count = output->dims->data[1];
+        float scores[count];
+
+        for(int i = 0; i < count; i++)
+            scores[i] = (output->data.uint8[i] - output->params.zero_point) * output->params.scale;
+
+        HandleOutput(scores, count);
+    }
+
+    // Reset buffer
+    memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
+    frame_index = 0;
 }
 
 extern "C" void reset_mfcc_buffer() { memset(mfcc_buffer,0,sizeof(mfcc_buffer)); frame_index=0; }
@@ -496,23 +493,30 @@ static float mel_to_hz(float mel) { return 700.0f * (powf(10.0f, mel/2595.0f) - 
 
 static void init_mel_filterbank() {
     float mel_min = hz_to_mel(0);
-    float mel_max = hz_to_mel(FRAME_SIZE/2);
+
+    // ✅ FIX #2: correct frequency range
+    float mel_max = hz_to_mel(SAMPLE_RATE / 2);
+
     float mel_points[MEL_FILTERS+2], hz_points[MEL_FILTERS+2];
     int bin[MEL_FILTERS+2];
 
     for (int i = 0; i < MEL_FILTERS+2; i++) {
         mel_points[i] = mel_min + (mel_max - mel_min)*i/(MEL_FILTERS+1);
         hz_points[i] = mel_to_hz(mel_points[i]);
-        bin[i] = (int)((FRAME_SIZE+1) * hz_points[i]/FRAME_SIZE);
+
+        // ✅ FIX #2: correct bin mapping
+        bin[i] = (int)((FRAME_SIZE + 1) * hz_points[i] / SAMPLE_RATE);
     }
 
     memset(mel_filterbank,0,sizeof(mel_filterbank));
 
     for (int m = 1; m <= MEL_FILTERS; m++) {
         int f_m_minus = bin[m-1], f_m = bin[m], f_m_plus = bin[m+1];
-        for (int k=f_m_minus;k<f_m&&k<FRAME_SIZE/2;k++)
+
+        for (int k=f_m_minus; k<f_m && k<FRAME_SIZE/2; k++)
             mel_filterbank[m-1][k]=(float)(k-f_m_minus)/(f_m-f_m_minus);
-        for (int k=f_m;k<f_m_plus&&k<FRAME_SIZE/2;k++)
+
+        for (int k=f_m; k<f_m_plus && k<FRAME_SIZE/2; k++)
             mel_filterbank[m-1][k]=(float)(f_m_plus-k)/(f_m_plus-f_m);
     }
 }
@@ -558,12 +562,31 @@ void mfcc_compute(float *input, float *mfcc_out) {
         for(int j=0;j<MEL_FILTERS;j++)
             mfcc_out[i]+=dct_matrix[i][j]*mel_energy[j];
     }
+
+    // ✅ FIX #1 — NORMALIZATION (MATCH TRAINING)
+    float mean = 0.0f;
+    for(int i = 0; i < MFCC_COUNT; i++) mean += mfcc_out[i];
+    mean /= MFCC_COUNT;
+
+    float var = 0.0f;
+    for(int i = 0; i < MFCC_COUNT; i++){
+        float d = mfcc_out[i] - mean;
+        var += d * d;
+    }
+    var /= MFCC_COUNT;
+
+    float std = sqrtf(var) + 1e-6f;
+
+    for(int i = 0; i < MFCC_COUNT; i++){
+        mfcc_out[i] = (mfcc_out[i] - mean) / std;
+    }
 }
 
 #### mfcc.h ####
 
 #pragma once
 
+#define SAMPLE_RATE 16000 
 #define FRAME_SIZE 512
 #define HOP_LENGTH 160
 #define MFCC_COUNT 13
@@ -581,7 +604,7 @@ const unsigned char g_model[] = {
   ...
   0x00, 0x00, 0x00, 0x72
 };
-const int g_model_len = 19744;
+const int g_model_len = 20104;
 
 #### model.h ####
 
@@ -600,7 +623,7 @@ extern "C" {
 #endif
 
 const char* kLabels[] = {
-    "yes","no","on","off"
+    "yes","no","on","off","up","down","left","right","stop","go"
 };
 
 void HandleOutput(float* scores, int count) {
@@ -632,6 +655,6 @@ void HandleOutput(float* scores, int count);
 }
 #endif
 
+############# Results #############
 
-### Output ###
 

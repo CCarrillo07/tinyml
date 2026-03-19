@@ -16,31 +16,41 @@ static float mel_to_hz(float mel) { return 700.0f * (powf(10.0f, mel/2595.0f) - 
 
 static void init_mel_filterbank() {
     float mel_min = hz_to_mel(0);
-    float mel_max = hz_to_mel(FRAME_SIZE/2);
+    float mel_max = hz_to_mel(SAMPLE_RATE / 2);
+
     float mel_points[MEL_FILTERS+2], hz_points[MEL_FILTERS+2];
     int bin[MEL_FILTERS+2];
 
     for (int i = 0; i < MEL_FILTERS+2; i++) {
         mel_points[i] = mel_min + (mel_max - mel_min)*i/(MEL_FILTERS+1);
         hz_points[i] = mel_to_hz(mel_points[i]);
-        bin[i] = (int)((FRAME_SIZE+1) * hz_points[i]/FRAME_SIZE);
+        bin[i] = (int)((FRAME_SIZE + 1) * hz_points[i] / SAMPLE_RATE);
     }
 
     memset(mel_filterbank,0,sizeof(mel_filterbank));
 
     for (int m = 1; m <= MEL_FILTERS; m++) {
         int f_m_minus = bin[m-1], f_m = bin[m], f_m_plus = bin[m+1];
-        for (int k=f_m_minus;k<f_m&&k<FRAME_SIZE/2;k++)
+
+        for (int k=f_m_minus; k<f_m && k<FRAME_SIZE/2; k++)
             mel_filterbank[m-1][k]=(float)(k-f_m_minus)/(f_m-f_m_minus);
-        for (int k=f_m;k<f_m_plus&&k<FRAME_SIZE/2;k++)
+
+        for (int k=f_m; k<f_m_plus && k<FRAME_SIZE/2; k++)
             mel_filterbank[m-1][k]=(float)(f_m_plus-k)/(f_m_plus-f_m);
     }
 }
 
+/* =========================
+   ✅ FIX #3 — DCT NORMALIZATION (MATCH LIBROSA)
+   ========================= */
 static void init_dct() {
-    for(int i=0;i<MFCC_COUNT;i++)
-        for(int j=0;j<MEL_FILTERS;j++)
-            dct_matrix[i][j]=cosf(i*(j+0.5f)*M_PI/MEL_FILTERS)*sqrtf(2.0f/MEL_FILTERS);
+    for(int i=0;i<MFCC_COUNT;i++){
+        for(int j=0;j<MEL_FILTERS;j++){
+            float scale = (i == 0) ? sqrtf(1.0f/MEL_FILTERS)
+                                  : sqrtf(2.0f/MEL_FILTERS);
+            dct_matrix[i][j] = scale * cosf(i*(j+0.5f)*M_PI/MEL_FILTERS);
+        }
+    }
 }
 
 static void mfcc_init() {
@@ -53,8 +63,12 @@ static void mfcc_init() {
 void mfcc_compute(float *input, float *mfcc_out) {
     mfcc_init();
 
+    /* =========================
+       ✅ FIX #1 — APPLY HANN WINDOW
+       ========================= */
     for (int i = 0; i < FRAME_SIZE; i++) {
-        fft_buffer[2*i] = input[i];
+        float window = 0.5f - 0.5f * cosf(2 * M_PI * i / (FRAME_SIZE - 1));
+        fft_buffer[2*i] = input[i] * window;
         fft_buffer[2*i+1] = 0.0f;
     }
 
@@ -70,12 +84,34 @@ void mfcc_compute(float *input, float *mfcc_out) {
     for(int m=0;m<MEL_FILTERS;m++){
         for(int k=0;k<FRAME_SIZE/2;k++)
             mel_energy[m]+=power[k]*mel_filterbank[m][k];
-        mel_energy[m]=logf(mel_energy[m]+1e-6f);
+
+        /* =========================
+           ✅ FIX #2 — LOG10 (MATCH LIBROSA)
+           ========================= */
+        mel_energy[m]=log10f(mel_energy[m]+1e-6f);
     }
 
     for(int i=0;i<MFCC_COUNT;i++){
         mfcc_out[i]=0;
         for(int j=0;j<MEL_FILTERS;j++)
             mfcc_out[i]+=dct_matrix[i][j]*mel_energy[j];
+    }
+
+    // Normalization (unchanged)
+    float mean = 0.0f;
+    for(int i = 0; i < MFCC_COUNT; i++) mean += mfcc_out[i];
+    mean /= MFCC_COUNT;
+
+    float var = 0.0f;
+    for(int i = 0; i < MFCC_COUNT; i++){
+        float d = mfcc_out[i] - mean;
+        var += d * d;
+    }
+    var /= MFCC_COUNT;
+
+    float std = sqrtf(var) + 1e-6f;
+
+    for(int i = 0; i < MFCC_COUNT; i++){
+        mfcc_out[i] = (mfcc_out[i] - mean) / std;
     }
 }
