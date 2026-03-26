@@ -6,3 +6,4 @@ dependencies:
   # # Put list of dependencies here
   espressif/esp-dsp: '*'
   espressif/esp-tflite-micro: '*'
+  lvgl/lvgl: ^8.3.11

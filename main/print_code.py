@@ -6,13 +6,16 @@ root_dir = '.'  # current directory, change if needed
 # File extensions to include
 extensions = ('.c', '.cc', '.h', '.yml', '.txt')
 
+# Files to exclude
+excluded_files = {'model.cc'}
+
 # Output file
 output_file = 'all_code_output.txt'
 
 with open(output_file, 'w', encoding='utf-8') as out_f:
     for subdir, dirs, files in os.walk(root_dir):
         for file in files:
-            if file.endswith(extensions):
+            if file.endswith(extensions) and file not in excluded_files:
                 file_path = os.path.join(subdir, file)
                 out_f.write(f"#### {file} ####\n\n")
                 try:

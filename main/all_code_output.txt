@@ -1,188 +1,3 @@
-
-############# TRAINING CODE #############
-!pip install librosa numpy==1.26.4 datasets==2.18.0 scikit-learn
-import numpy as np
-import tensorflow as tf
-import librosa
-from datasets import load_dataset
-from sklearn.metrics import classification_report
-SAMPLE_RATE = 16000
-FRAME_SIZE = 512
-MFCC_COUNT = 13
-MEL_FILTERS = 26
-MAX_FRAMES = 100
-
-BATCH_SIZE = 32
-EPOCHS = 50
-
-dataset = load_dataset("google/speech_commands", "v0.02", trust_remote_code=True)
-
-COMMANDS = ["yes","no","on","off","up","down","left","right","stop","go"]
-
-label_to_index = {cmd:i for i,cmd in enumerate(COMMANDS)}
-
-def filter_commands(example):
-    return labels[example["label"]] in COMMANDS
-
-dataset["train"] = dataset["train"].filter(filter_commands)
-dataset["validation"] = dataset["validation"].filter(filter_commands)
-dataset["test"] = dataset["test"].filter(filter_commands)
-
-NUM_CLASSES = len(COMMANDS)
-
-print("Classes:", COMMANDS)
-print("Number of Classes:", NUM_CLASSES)
-
-def preprocess(example):
-
-    audio = example["audio"]["array"]
-    sr = example["audio"]["sampling_rate"]
-
-    if sr != SAMPLE_RATE:
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
-
-    mfcc = librosa.feature.mfcc(
-        y=audio,
-        sr=SAMPLE_RATE,
-        n_mfcc=MFCC_COUNT,
-        n_fft=FRAME_SIZE,
-        hop_length=160,
-        n_mels=MEL_FILTERS
-    )
-
-    mfcc = mfcc.T
-
-    if mfcc.shape[0] < MAX_FRAMES:
-        pad = MAX_FRAMES - mfcc.shape[0]
-        mfcc = np.pad(mfcc, ((0,pad),(0,0)))
-    else:
-        mfcc = mfcc[:MAX_FRAMES]
-
-    mfcc = (mfcc - np.mean(mfcc)) / (np.std(mfcc) + 1e-6)
-
-    mfcc = np.expand_dims(mfcc, -1)
-
-    label_name = labels[example["label"]]
-    label = label_to_index[label_name]
-
-    return {
-        "audio": mfcc.astype(np.float32),
-        "label": label
-    }
-
-train_ds_hf = dataset["train"].map(preprocess, num_proc=4)
-val_ds_hf = dataset["validation"].map(preprocess, num_proc=4)
-test_ds_hf = dataset["test"].map(preprocess, num_proc=4)
-
-train_ds = train_ds_hf.to_tf_dataset(
-    columns=["audio"],
-    label_cols=["label"],
-    batch_size=BATCH_SIZE,
-    shuffle=True
-).prefetch(tf.data.AUTOTUNE)
-
-val_ds = val_ds_hf.to_tf_dataset(
-    columns=["audio"],
-    label_cols=["label"],
-    batch_size=BATCH_SIZE
-).prefetch(tf.data.AUTOTUNE)
-
-test_ds = test_ds_hf.to_tf_dataset(
-    columns=["audio"],
-    label_cols=["label"],
-    batch_size=BATCH_SIZE
-)
-
-model = tf.keras.Sequential([
-    tf.keras.layers.Input(shape=(MAX_FRAMES, MFCC_COUNT, 1)),
-    tf.keras.layers.Conv2D(8, (3,3), activation="relu"),
-    tf.keras.layers.MaxPool2D((2,2)),
-    tf.keras.layers.Conv2D(16, (3,3), activation="relu"),
-    tf.keras.layers.MaxPool2D((2,2)),
-    tf.keras.layers.Flatten(),
-    tf.keras.layers.Dense(32, activation="relu"),
-    tf.keras.layers.Dense(NUM_CLASSES, activation="softmax")
-])
-
-model.compile(
-    optimizer="adam",
-    loss="sparse_categorical_crossentropy",
-    metrics=["accuracy"]
-)
-
-model.summary()
-
-early_stopping = tf.keras.callbacks.EarlyStopping(
-    monitor="val_loss",
-    patience=5,
-    restore_best_weights=True
-)
-
-history = model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=EPOCHS,
-    callbacks=[early_stopping]
-)
-
-results = model.evaluate(test_ds)
-print("Test accuracy:", results[1])
-
-Test accuracy: 0.8082965016365051
-
-predictions = []
-true_labels = []
-
-for X,y in test_ds:
-    pred = model.predict(X)
-    predictions.extend(np.argmax(pred,axis=1))
-    true_labels.extend(y.numpy())
-
-print(classification_report(true_labels,predictions,target_names=COMMANDS))
-
-precision    recall  f1-score   support
-
-         yes       0.89      0.92      0.91       419
-          no       0.79      0.74      0.76       405
-          on       0.85      0.82      0.83       396
-         off       0.82      0.79      0.80       402
-          up       0.79      0.75      0.77       425
-        down       0.72      0.81      0.76       406
-        left       0.76      0.78      0.77       412
-       right       0.85      0.88      0.86       396
-        stop       0.93      0.91      0.92       411
-          go       0.71      0.68      0.70       402
-
-    accuracy                           0.81      4074
-   macro avg       0.81      0.81      0.81      4074
-weighted avg       0.81      0.81      0.81      4074
-
-def representative_dataset():
-    for X, _ in train_ds.take(100):
-        # <<< CHANGE: ensure 4D shape for TFLite int8 quantization
-        if X.ndim == 3:
-            X = np.expand_dims(X, -1)
-        yield [X]
-
-converter = tf.lite.TFLiteConverter.from_keras_model(model)
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
-converter.representative_dataset = representative_dataset
-converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-
-# <<< CHANGE: input/output types set for INT8 quantization
-converter.inference_input_type = tf.uint8
-converter.inference_output_type = tf.uint8
-
-tflite_model = converter.convert()
-
-# Save TFLite model
-with open("speech_commands_mfcc.tflite", "wb") as f:
-    f.write(tflite_model)
-
-print("Quantized TFLite model saved: speech_commands_mfcc.tflite")
-
-############# ESP32 CODE #############
-
 #### audio_i2s.c ####
 
 #include "audio_i2s.h"
@@ -191,6 +6,11 @@ print("Quantized TFLite model saved: speech_commands_mfcc.tflite")
 
 #define I2S_NUM I2S_NUM_0
 #define FRAME_SIZE 512
+
+/* =========================
+   ✅ FIX — MOVE BUFFER TO STATIC (NO STACK OVERFLOW)
+   ========================= */
+static int32_t raw_buffer[FRAME_SIZE];
 
 void audio_i2s_init(void)
 {
@@ -220,12 +40,22 @@ void audio_i2s_init(void)
 
 void audio_i2s_read(int16_t *buffer, int samples)
 {
-    int32_t raw[samples];
     size_t bytes_read;
-    i2s_read(I2S_NUM, raw, samples * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+
+    i2s_read(
+        I2S_NUM,
+        raw_buffer,
+        samples * sizeof(int32_t),
+        &bytes_read,
+        portMAX_DELAY
+    );
+
     int count = bytes_read / sizeof(int32_t);
+
     for (int i = 0; i < count; i++)
-        buffer[i] = raw[i] >> 8;
+    {
+        buffer[i] = raw_buffer[i] >> 8;
+    }
 }
 
 #### audio_i2s.h ####
@@ -241,15 +71,16 @@ void audio_i2s_read(int16_t *buffer, int samples);
 #### CMakeLists.txt ####
 
 idf_component_register(
-    SRCS "audio_i2s.c"
-    "constants.cc"
-    "main_functions.cc"
-    "main.c" 
-    "mfcc.c" 
-    "model.cc" 
-    "output_handler.cc"
-    INCLUDE_DIRS "."   
-    PRIV_REQUIRES driver freertos esp-dsp
+    SRCS "gc9a01_lvgl.c"
+         "audio_i2s.c"
+         "constants.cc"
+         "main_functions.cc"
+         "main.c"
+         "mfcc.c"
+         "model.cc"
+         "output_handler.cc"
+    INCLUDE_DIRS "."
+    REQUIRES driver freertos esp-dsp lvgl esp_lcd
 )
 
 #### constants.cc ####
@@ -266,6 +97,175 @@ const int kInferencesPerCycle = 20;
 
 #endif // CONSTANTS_H
 
+#### gc9a01_lvgl.c ####
+
+#include "gc9a01_lvgl.h"
+#include "lvgl.h"
+
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h" 
+
+#include "driver/spi_master.h"
+#include "esp_timer.h"
+#include <stdio.h>
+
+#define SCREEN_WIDTH 240
+#define SCREEN_HEIGHT 240
+
+/* Pins */
+#define PIN_SCLK 2
+#define PIN_MOSI 3
+#define PIN_DC   10
+#define PIN_CS   7
+#define PIN_RST  8
+
+static lv_obj_t *label;
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf[SCREEN_WIDTH * 20];
+
+static esp_lcd_panel_handle_t panel_handle;
+
+/* Flush callback */
+static void my_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+{
+    esp_lcd_panel_draw_bitmap(panel_handle,
+        area->x1,
+        area->y1,
+        area->x2 + 1,
+        area->y2 + 1,
+        color_map);
+
+    lv_disp_flush_ready(drv);
+}
+
+/* LVGL tick */
+static void lv_tick_task(void *arg)
+{
+    lv_tick_inc(2);
+}
+
+/* Fade animation */
+static void set_opa(void *obj, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)obj, v, 0);
+}
+
+void lcd_lvgl_init(void)
+{
+    /* SPI BUS */
+    spi_bus_config_t buscfg = {
+        .sclk_io_num = PIN_SCLK,
+        .mosi_io_num = PIN_MOSI,
+        .miso_io_num = -1,
+        .max_transfer_sz = SCREEN_WIDTH * SCREEN_HEIGHT * 2
+    };
+
+    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+
+    /* ✅ FIX: use generic SPI config (correct for IDF 5.5) */
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = PIN_DC,
+        .cs_gpio_num = PIN_CS,
+        .pclk_hz = 40 * 1000 * 1000,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+    };
+
+    esp_lcd_new_panel_io_spi(SPI2_HOST, &io_config, &io_handle);
+
+    /* Panel config */
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = PIN_RST,
+        .color_space = ESP_LCD_COLOR_SPACE_RGB,
+        .bits_per_pixel = 16,
+    };
+
+    /* ✅ Keep ST7789 (compatible fallback for many GC9A01 boards) */
+    esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle);
+
+    esp_lcd_panel_reset(panel_handle);
+    esp_lcd_panel_init(panel_handle);
+    esp_lcd_panel_invert_color(panel_handle, true);
+    esp_lcd_panel_disp_on_off(panel_handle, true);
+
+    /* LVGL INIT */
+    lv_init();
+
+    lv_disp_draw_buf_init(&draw_buf, buf, NULL, SCREEN_WIDTH * 20);
+
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+
+    disp_drv.hor_res = SCREEN_WIDTH;
+    disp_drv.ver_res = SCREEN_HEIGHT;
+    disp_drv.flush_cb = my_flush_cb;
+    disp_drv.draw_buf = &draw_buf;
+
+    lv_disp_drv_register(&disp_drv);
+
+    /* Tick timer */
+    const esp_timer_create_args_t periodic_timer_args = {
+        .callback = &lv_tick_task
+    };
+
+    esp_timer_handle_t timer;
+    esp_timer_create(&periodic_timer_args, &timer);
+    esp_timer_start_periodic(timer, 2000);
+
+    /* Label */
+    label = lv_label_create(lv_scr_act());
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_center(label);
+    lv_label_set_text(label, "...");
+}
+
+/* Display function */
+void display_big_label(const char *text)
+{
+    lv_anim_t a;
+
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, label);
+    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_time(&a, 300);
+    lv_anim_set_exec_cb(&a, set_opa);
+    lv_anim_start(&a);
+
+    lv_timer_handler();
+
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
+
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, label);
+    lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_time(&a, 300);
+    lv_anim_set_exec_cb(&a, set_opa);
+    lv_anim_start(&a);
+
+    lv_timer_handler();
+}
+
+#### gc9a01_lvgl.h ####
+
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void lcd_lvgl_init(void);
+void display_big_label(const char *text);
+
+#ifdef __cplusplus
+}
+#endif
+
 #### idf_component.yml ####
 
 ## IDF Component Manager Manifest File
@@ -276,11 +276,13 @@ dependencies:
   # # Put list of dependencies here
   espressif/esp-dsp: '*'
   espressif/esp-tflite-micro: '*'
+  lvgl/lvgl: ^8.3.11
 
 
 #### main.c ####
 
-#include <string.h>    
+#include <string.h>  
+#include <math.h>    
 #include "audio_i2s.h"
 #include "mfcc.h"
 #include "main_functions.h"
@@ -288,67 +290,129 @@ dependencies:
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lvgl.h"
+#include "esp_log.h"
 
 #define FRAME_SIZE 512
-#define VAD_THRESHOLD 12000
-#define SILENCE_FRAMES_END 12
-#define MIN_SPEECH_FRAMES 6
 #define HOP_LENGTH 160
 
-static int16_t audio_buffer[FRAME_SIZE];
+static const char *TAG = "VAD";
+
+#define VAD_THRESHOLD 10000
+#define VAD_MIN_ENERGY 800
+#define SILENCE_FRAMES_END 15
+#define MIN_SPEECH_FRAMES 20
+#define SPEECH_START_FRAMES 3
+
+static int16_t circular_buffer[FRAME_SIZE];
 static float audio_float[FRAME_SIZE];
 static float mfcc[MFCC_COUNT];
-static float sliding_buffer[FRAME_SIZE]={0};
-static int speech_active=0;
-static int silence_count=0;
 
+static int initialized = 0;
+static int speech_active = 0;
+static int silence_count = 0;
+
+// =========================
+// VAD function
+// =========================
 int detect_speech(int16_t *buffer){
-    long energy=0;
-    for(int i=0;i<FRAME_SIZE;i++) energy+=abs(buffer[i]);
-    energy/=FRAME_SIZE;
 
-    static int speech_frames=0;
-    if(energy>VAD_THRESHOLD) speech_frames++;
-    else speech_frames=0;
-    return speech_frames>2;
+    long energy = 0;
+    for(int i = 0; i < FRAME_SIZE; i++){
+        energy += abs(buffer[i]);
+    }
+    energy /= FRAME_SIZE;
+
+    // ✅ DEBUG ONLY WHEN THRESHOLD EXCEEDED
+    if(energy > VAD_THRESHOLD){
+        ESP_LOGI(TAG, "Energy above threshold: %ld", energy);
+    }
+
+    if(energy < VAD_MIN_ENERGY){
+        return 0;
+    }
+
+    static int speech_frames = 0;
+
+    if(energy > VAD_THRESHOLD){
+        speech_frames++;
+    } else {
+        speech_frames = 0;
+    }
+
+    return speech_frames > SPEECH_START_FRAMES;
 }
 
+// =========================
+// Main loop
+// =========================
 void app_main(void){
+
     setup();
     audio_i2s_init();
 
     while(1){
-        audio_i2s_read(audio_buffer, FRAME_SIZE);
-        int speech=detect_speech(audio_buffer);
+
+        lv_timer_handler();
+
+        memmove(circular_buffer,
+                circular_buffer + HOP_LENGTH,
+                (FRAME_SIZE - HOP_LENGTH) * sizeof(int16_t));
+
+        audio_i2s_read(
+            circular_buffer + (FRAME_SIZE - HOP_LENGTH),
+            HOP_LENGTH
+        );
+
+        if(!initialized){
+            initialized = 1;
+            continue;
+        }
+
+        int speech = detect_speech(circular_buffer);
 
         if(speech){
-            speech_active=1;
-            silence_count=0;
-            for(int i=0;i<FRAME_SIZE;i++) audio_float[i]=(float)audio_buffer[i];
+            speech_active = 1;
+            silence_count = 0;
 
-            for(int i=0;i<=FRAME_SIZE-HOP_LENGTH;i+=HOP_LENGTH){
-                for(int j=0;j<HOP_LENGTH;j++){
-                    memmove(sliding_buffer,sliding_buffer+1,(FRAME_SIZE-1)*sizeof(float));
-                    sliding_buffer[FRAME_SIZE-1]=audio_float[i+j];
-                }
-                mfcc_compute(sliding_buffer, mfcc);
-                loop(mfcc);
+            // Convert to float and normalize
+            float max_val = 0.0f;
+            for(int i=0;i<FRAME_SIZE;i++){
+                audio_float[i] = (float)circular_buffer[i] / 32768.0f;
+                if(fabsf(audio_float[i]) > max_val) max_val = fabsf(audio_float[i]);
             }
+            float scale = (max_val>1e-6f)?max_val:1.0f;
+            for(int i=0;i<FRAME_SIZE;i++) audio_float[i] /= scale;
+
+            // Compute MFCC
+            mfcc_compute(audio_float, mfcc);
+
+            // 🔥 DEBUG: print first 5 MFCC coefficients
+            ESP_LOGI(TAG, "MFCC[0..4]: %.3f %.3f %.3f %.3f %.3f",
+                     mfcc[0], mfcc[1], mfcc[2], mfcc[3], mfcc[4]);
+
+            loop(mfcc);
+
         } else {
             if(speech_active){
                 silence_count++;
-                if(silence_count>SILENCE_FRAMES_END){
-                    int frames=get_frame_count();
-                    if(frames>=MIN_SPEECH_FRAMES){
+                if(silence_count > SILENCE_FRAMES_END){
+                    int frames = get_frame_count();
+                    ESP_LOGI(TAG, "Speech ended. Frames captured: %d", frames);
+                    if(frames >= MIN_SPEECH_FRAMES){
+                        ESP_LOGI(TAG, "Running inference...");
                         run_inference_on_speech();
+                    } else {
+                        ESP_LOGI(TAG, "Rejected (too short)");
                     }
                     reset_mfcc_buffer();
-                    speech_active=0;
-                    silence_count=0;
+                    speech_active = 0;
+                    silence_count = 0;
                 }
             }
         }
-        vTaskDelay(1);
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -367,6 +431,9 @@ void app_main(void){
 #include <math.h>
 #include "esp_log.h"
 
+#include "gc9a01_lvgl.h"
+#include "lvgl.h"
+
 static const char* TAG = "TinyML";
 
 namespace {
@@ -376,7 +443,7 @@ tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 TfLiteTensor* output = nullptr;
 
-constexpr int kTensorArenaSize = 40*1024;
+constexpr int kTensorArenaSize = 90*1024;  // ✅ increased
 uint8_t tensor_arena[kTensorArenaSize];
 
 float mfcc_buffer[MAX_FRAMES][MFCC_COUNT];
@@ -392,25 +459,29 @@ void setup() {
     resolver.AddFullyConnected();
     resolver.AddMaxPool2D();
     resolver.AddPack();
-    resolver.AddQuantize();
     resolver.AddReshape();
     resolver.AddShape();
     resolver.AddSoftmax();
     resolver.AddStridedSlice();
 
-    static tflite::MicroInterpreter static_interpreter(model,resolver,tensor_arena,kTensorArenaSize);
+    static tflite::MicroInterpreter static_interpreter(
+        model, resolver, tensor_arena, kTensorArenaSize);
+
     interpreter = &static_interpreter;
     interpreter->AllocateTensors();
+
     input = interpreter->input(0);
     output = interpreter->output(0);
 
-    memset(mfcc_buffer,0,sizeof(mfcc_buffer));
-    frame_index=0;
+    memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
+    frame_index = 0;
+
+    lcd_lvgl_init();
 }
 
 void loop(float* mfcc) {
-    if(frame_index<MAX_FRAMES){
-        memcpy(mfcc_buffer[frame_index], mfcc, sizeof(float)*MFCC_COUNT);
+    if(frame_index < MAX_FRAMES){
+        memcpy(mfcc_buffer[frame_index], mfcc, sizeof(float) * MFCC_COUNT);
         frame_index++;
     }
 }
@@ -418,42 +489,61 @@ void loop(float* mfcc) {
 extern "C" void run_inference_on_speech() {
     if(frame_index == 0) return;
 
-    // Ensure MAX_FRAMES x MFCC_COUNT buffer is filled
-    int offset = (MAX_FRAMES - frame_index) / 2;
+    int offset = 0;  // ✅ FIXED (no centering)
 
     for(int i = 0; i < MAX_FRAMES; i++) {
         for(int j = 0; j < MFCC_COUNT; j++) {
+
             float value = 0.0f;
             int src = i - offset;
-            if(src >= 0 && src < frame_index) value = mfcc_buffer[src][j];
 
-            // Quantize using input tensor params
-            int32_t scaled = (int32_t)(value / input->params.scale + input->params.zero_point);
-            if(scaled < 0) scaled = 0;
-            if(scaled > 255) scaled = 255;
+            if(src >= 0 && src < frame_index)
+                value = mfcc_buffer[src][j];
 
-            input->data.uint8[i * MFCC_COUNT + j] = (uint8_t)scaled;
+            // ✅ FIX CHANNEL DIMENSION
+            int index = i * MFCC_COUNT + j;
+            input->data.f[index] = value;
         }
     }
 
-    // Run inference
     if(interpreter->Invoke() == kTfLiteOk) {
+
         int count = output->dims->data[1];
+
         float scores[count];
 
         for(int i = 0; i < count; i++)
-            scores[i] = (output->data.uint8[i] - output->params.zero_point) * output->params.scale;
+            scores[i] = output->data.f[i];
 
         HandleOutput(scores, count);
+
+        int max_idx = 0;
+        float max_score = scores[0];
+
+        for(int i = 1; i < count; i++) {
+            if(scores[i] > max_score) {
+                max_score = scores[i];
+                max_idx = i;
+            }
+        }
+
+        ESP_LOGI(TAG, "TOP: %s (%.2f)", kLabels[max_idx], max_score);
+
+        display_big_label(kLabels[max_idx]);
     }
 
-    // Reset buffer
     memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
     frame_index = 0;
 }
 
-extern "C" void reset_mfcc_buffer() { memset(mfcc_buffer,0,sizeof(mfcc_buffer)); frame_index=0; }
-extern "C" int get_frame_count() { return frame_index; }
+extern "C" void reset_mfcc_buffer() {
+    memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
+    frame_index = 0;
+}
+
+extern "C" int get_frame_count() {
+    return frame_index;
+}
 
 #### main_functions.h ####
 
@@ -493,8 +583,6 @@ static float mel_to_hz(float mel) { return 700.0f * (powf(10.0f, mel/2595.0f) - 
 
 static void init_mel_filterbank() {
     float mel_min = hz_to_mel(0);
-
-    // ✅ FIX #2: correct frequency range
     float mel_max = hz_to_mel(SAMPLE_RATE / 2);
 
     float mel_points[MEL_FILTERS+2], hz_points[MEL_FILTERS+2];
@@ -503,8 +591,6 @@ static void init_mel_filterbank() {
     for (int i = 0; i < MEL_FILTERS+2; i++) {
         mel_points[i] = mel_min + (mel_max - mel_min)*i/(MEL_FILTERS+1);
         hz_points[i] = mel_to_hz(mel_points[i]);
-
-        // ✅ FIX #2: correct bin mapping
         bin[i] = (int)((FRAME_SIZE + 1) * hz_points[i] / SAMPLE_RATE);
     }
 
@@ -522,9 +608,13 @@ static void init_mel_filterbank() {
 }
 
 static void init_dct() {
-    for(int i=0;i<MFCC_COUNT;i++)
-        for(int j=0;j<MEL_FILTERS;j++)
-            dct_matrix[i][j]=cosf(i*(j+0.5f)*M_PI/MEL_FILTERS)*sqrtf(2.0f/MEL_FILTERS);
+    for(int i=0;i<MFCC_COUNT;i++){
+        for(int j=0;j<MEL_FILTERS;j++){
+            float scale = (i == 0) ? sqrtf(1.0f/MEL_FILTERS)
+                                  : sqrtf(2.0f/MEL_FILTERS);
+            dct_matrix[i][j] = scale * cosf(i*(j+0.5f)*M_PI/MEL_FILTERS);
+        }
+    }
 }
 
 static void mfcc_init() {
@@ -538,7 +628,8 @@ void mfcc_compute(float *input, float *mfcc_out) {
     mfcc_init();
 
     for (int i = 0; i < FRAME_SIZE; i++) {
-        fft_buffer[2*i] = input[i];
+        float window = 0.5f - 0.5f * cosf(2 * M_PI * i / (FRAME_SIZE - 1));
+        fft_buffer[2*i] = input[i] * window;
         fft_buffer[2*i+1] = 0.0f;
     }
 
@@ -554,31 +645,14 @@ void mfcc_compute(float *input, float *mfcc_out) {
     for(int m=0;m<MEL_FILTERS;m++){
         for(int k=0;k<FRAME_SIZE/2;k++)
             mel_energy[m]+=power[k]*mel_filterbank[m][k];
-        mel_energy[m]=logf(mel_energy[m]+1e-6f);
+
+        mel_energy[m]=log10f(mel_energy[m]+1e-6f);
     }
 
     for(int i=0;i<MFCC_COUNT;i++){
         mfcc_out[i]=0;
         for(int j=0;j<MEL_FILTERS;j++)
             mfcc_out[i]+=dct_matrix[i][j]*mel_energy[j];
-    }
-
-    // ✅ FIX #1 — NORMALIZATION (MATCH TRAINING)
-    float mean = 0.0f;
-    for(int i = 0; i < MFCC_COUNT; i++) mean += mfcc_out[i];
-    mean /= MFCC_COUNT;
-
-    float var = 0.0f;
-    for(int i = 0; i < MFCC_COUNT; i++){
-        float d = mfcc_out[i] - mean;
-        var += d * d;
-    }
-    var /= MFCC_COUNT;
-
-    float std = sqrtf(var) + 1e-6f;
-
-    for(int i = 0; i < MFCC_COUNT; i++){
-        mfcc_out[i] = (mfcc_out[i] - mean) / std;
     }
 }
 
@@ -594,17 +668,6 @@ void mfcc_compute(float *input, float *mfcc_out) {
 #define MAX_FRAMES 100
 
 void mfcc_compute(float *audio, float *mfcc_out);
-
-#### model.cc ####
-
-#include "model.h"
-
-const unsigned char g_model[] = {
-  0x20, 0x00, 0x00, 0x00, 0x54, 0x46, 0x4c, 0x33, 0x00, 0x00, 0x00, 0x00,
-  ...
-  0x00, 0x00, 0x00, 0x72
-};
-const int g_model_len = 20104;
 
 #### model.h ####
 
@@ -651,10 +714,10 @@ extern "C" {
 
 void HandleOutput(float* scores, int count);
 
+/* ✅ ADD THIS */
+extern const char* kLabels[];
+
 #ifdef __cplusplus
 }
 #endif
-
-############# Results #############
-
 

@@ -40,9 +40,6 @@ static void init_mel_filterbank() {
     }
 }
 
-/* =========================
-   ✅ FIX #3 — DCT NORMALIZATION (MATCH LIBROSA)
-   ========================= */
 static void init_dct() {
     for(int i=0;i<MFCC_COUNT;i++){
         for(int j=0;j<MEL_FILTERS;j++){
@@ -63,9 +60,6 @@ static void mfcc_init() {
 void mfcc_compute(float *input, float *mfcc_out) {
     mfcc_init();
 
-    /* =========================
-       ✅ FIX #1 — APPLY HANN WINDOW
-       ========================= */
     for (int i = 0; i < FRAME_SIZE; i++) {
         float window = 0.5f - 0.5f * cosf(2 * M_PI * i / (FRAME_SIZE - 1));
         fft_buffer[2*i] = input[i] * window;
@@ -85,9 +79,6 @@ void mfcc_compute(float *input, float *mfcc_out) {
         for(int k=0;k<FRAME_SIZE/2;k++)
             mel_energy[m]+=power[k]*mel_filterbank[m][k];
 
-        /* =========================
-           ✅ FIX #2 — LOG10 (MATCH LIBROSA)
-           ========================= */
         mel_energy[m]=log10f(mel_energy[m]+1e-6f);
     }
 
@@ -95,23 +86,5 @@ void mfcc_compute(float *input, float *mfcc_out) {
         mfcc_out[i]=0;
         for(int j=0;j<MEL_FILTERS;j++)
             mfcc_out[i]+=dct_matrix[i][j]*mel_energy[j];
-    }
-
-    // Normalization (unchanged)
-    float mean = 0.0f;
-    for(int i = 0; i < MFCC_COUNT; i++) mean += mfcc_out[i];
-    mean /= MFCC_COUNT;
-
-    float var = 0.0f;
-    for(int i = 0; i < MFCC_COUNT; i++){
-        float d = mfcc_out[i] - mean;
-        var += d * d;
-    }
-    var /= MFCC_COUNT;
-
-    float std = sqrtf(var) + 1e-6f;
-
-    for(int i = 0; i < MFCC_COUNT; i++){
-        mfcc_out[i] = (mfcc_out[i] - mean) / std;
     }
 }

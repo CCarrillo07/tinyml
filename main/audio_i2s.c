@@ -5,6 +5,11 @@
 #define I2S_NUM I2S_NUM_0
 #define FRAME_SIZE 512
 
+/* =========================
+   ✅ FIX — MOVE BUFFER TO STATIC (NO STACK OVERFLOW)
+   ========================= */
+static int32_t raw_buffer[FRAME_SIZE];
+
 void audio_i2s_init(void)
 {
     i2s_config_t config = {
@@ -33,10 +38,20 @@ void audio_i2s_init(void)
 
 void audio_i2s_read(int16_t *buffer, int samples)
 {
-    int32_t raw[samples];
     size_t bytes_read;
-    i2s_read(I2S_NUM, raw, samples * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+
+    i2s_read(
+        I2S_NUM,
+        raw_buffer,
+        samples * sizeof(int32_t),
+        &bytes_read,
+        portMAX_DELAY
+    );
+
     int count = bytes_read / sizeof(int32_t);
+
     for (int i = 0; i < count; i++)
-        buffer[i] = raw[i] >> 8;
+    {
+        buffer[i] = raw_buffer[i] >> 8;
+    }
 }
