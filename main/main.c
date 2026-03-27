@@ -17,8 +17,8 @@ static const char *TAG = "VAD";
 
 #define VAD_THRESHOLD 10000
 #define VAD_MIN_ENERGY 800
-#define SILENCE_FRAMES_END 15
-#define MIN_SPEECH_FRAMES 20
+#define SILENCE_FRAMES_END 10
+#define MIN_SPEECH_FRAMES 5   // 🔥 lowered (important)
 #define SPEECH_START_FRAMES 3
 
 static int16_t circular_buffer[FRAME_SIZE];
@@ -30,7 +30,7 @@ static int speech_active = 0;
 static int silence_count = 0;
 
 // =========================
-// VAD function
+// VAD
 // =========================
 int detect_speech(int16_t *buffer){
 
@@ -40,7 +40,6 @@ int detect_speech(int16_t *buffer){
     }
     energy /= FRAME_SIZE;
 
-    // ✅ DEBUG ONLY WHEN THRESHOLD EXCEEDED
     if(energy > VAD_THRESHOLD){
         ESP_LOGI(TAG, "Energy above threshold: %ld", energy);
     }
@@ -61,7 +60,7 @@ int detect_speech(int16_t *buffer){
 }
 
 // =========================
-// Main loop
+// MAIN
 // =========================
 void app_main(void){
 
@@ -92,36 +91,45 @@ void app_main(void){
             speech_active = 1;
             silence_count = 0;
 
-            // Convert to float and normalize
             float max_val = 0.0f;
+
             for(int i=0;i<FRAME_SIZE;i++){
                 audio_float[i] = (float)circular_buffer[i] / 32768.0f;
                 if(fabsf(audio_float[i]) > max_val) max_val = fabsf(audio_float[i]);
             }
-            float scale = (max_val>1e-6f)?max_val:1.0f;
-            for(int i=0;i<FRAME_SIZE;i++) audio_float[i] /= scale;
 
-            // Compute MFCC
+            float scale = (max_val>1e-6f)?max_val:1.0f;
+
+            for(int i=0;i<FRAME_SIZE;i++){
+                audio_float[i] /= scale;
+            }
+
             mfcc_compute(audio_float, mfcc);
 
-            // 🔥 DEBUG: print first 5 MFCC coefficients
             ESP_LOGI(TAG, "MFCC[0..4]: %.3f %.3f %.3f %.3f %.3f",
                      mfcc[0], mfcc[1], mfcc[2], mfcc[3], mfcc[4]);
 
             loop(mfcc);
 
         } else {
+
             if(speech_active){
+
                 silence_count++;
+
                 if(silence_count > SILENCE_FRAMES_END){
+
                     int frames = get_frame_count();
+
                     ESP_LOGI(TAG, "Speech ended. Frames captured: %d", frames);
+
                     if(frames >= MIN_SPEECH_FRAMES){
                         ESP_LOGI(TAG, "Running inference...");
-                        run_inference_on_speech();
+                        run_inference_on_speech();   // 🔥 NOW SAFE
                     } else {
                         ESP_LOGI(TAG, "Rejected (too short)");
                     }
+
                     reset_mfcc_buffer();
                     speech_active = 0;
                     silence_count = 0;

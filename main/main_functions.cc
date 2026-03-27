@@ -23,7 +23,7 @@ tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 TfLiteTensor* output = nullptr;
 
-constexpr int kTensorArenaSize = 90*1024;  // ✅ increased
+constexpr int kTensorArenaSize = 90*1024;
 uint8_t tensor_arena[kTensorArenaSize];
 
 float mfcc_buffer[MAX_FRAMES][MFCC_COUNT];
@@ -31,7 +31,11 @@ int frame_index = 0;
 
 }
 
+// =========================
+// SETUP
+// =========================
 void setup() {
+
     model = tflite::GetModel(g_model);
 
     static tflite::MicroMutableOpResolver<10> resolver;
@@ -59,28 +63,40 @@ void setup() {
     lcd_lvgl_init();
 }
 
+// =========================
+// COLLECT FRAMES
+// =========================
 void loop(float* mfcc) {
+
     if(frame_index < MAX_FRAMES){
         memcpy(mfcc_buffer[frame_index], mfcc, sizeof(float) * MFCC_COUNT);
         frame_index++;
     }
 }
 
+// =========================
+// 🔥 FINAL FIX: PAD / TRUNCATE
+// =========================
 extern "C" void run_inference_on_speech() {
+
     if(frame_index == 0) return;
 
-    int offset = 0;  // ✅ FIXED (no centering)
+    ESP_LOGI(TAG, "Preparing input. Frames: %d", frame_index);
 
+    // 🔥 ALWAYS produce EXACTLY 100 frames
     for(int i = 0; i < MAX_FRAMES; i++) {
+
         for(int j = 0; j < MFCC_COUNT; j++) {
 
             float value = 0.0f;
-            int src = i - offset;
 
-            if(src >= 0 && src < frame_index)
-                value = mfcc_buffer[src][j];
+            if(i < frame_index){
+                value = mfcc_buffer[i][j];  // real data
+            } else {
+                value = 0.0f;               // padding
+            }
 
-            // ✅ FIX CHANNEL DIMENSION
+            // 🔥 FIX: correct tensor indexing (WITH CHANNEL)
             int index = i * MFCC_COUNT + j;
             input->data.f[index] = value;
         }
@@ -92,16 +108,17 @@ extern "C" void run_inference_on_speech() {
 
         float scores[count];
 
-        for(int i = 0; i < count; i++)
+        for(int i = 0; i < count; i++){
             scores[i] = output->data.f[i];
+        }
 
         HandleOutput(scores, count);
 
         int max_idx = 0;
         float max_score = scores[0];
 
-        for(int i = 1; i < count; i++) {
-            if(scores[i] > max_score) {
+        for(int i = 1; i < count; i++){
+            if(scores[i] > max_score){
                 max_score = scores[i];
                 max_idx = i;
             }
@@ -116,6 +133,7 @@ extern "C" void run_inference_on_speech() {
     frame_index = 0;
 }
 
+// =========================
 extern "C" void reset_mfcc_buffer() {
     memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
     frame_index = 0;
