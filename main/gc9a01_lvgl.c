@@ -13,11 +13,11 @@
 #define SCREEN_HEIGHT 240
 
 /* Pins */
-#define PIN_SCLK 2
-#define PIN_MOSI 3
-#define PIN_DC   10
-#define PIN_CS   7
-#define PIN_RST  8
+#define PIN_SCLK 18
+#define PIN_MOSI 23
+#define PIN_DC   2
+#define PIN_CS   5
+#define PIN_RST  4
 
 static lv_obj_t *label;
 static lv_disp_draw_buf_t draw_buf;
@@ -123,7 +123,7 @@ void lcd_lvgl_init(void)
     lv_label_set_text(label, "...");
 }
 
-/* Display function */
+/* Display function 
 void display_big_label(const char *text)
 {
     lv_anim_t a;
@@ -148,4 +148,10 @@ void display_big_label(const char *text)
     lv_anim_start(&a);
 
     lv_timer_handler();
+}
+*/
+void display_big_label(const char *text)
+{
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
 }

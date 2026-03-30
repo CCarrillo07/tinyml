@@ -1,5 +1,5 @@
-#include <string.h>  
-#include <math.h>    
+#include <string.h>
+#include <math.h>
 #include "audio_i2s.h"
 #include "mfcc.h"
 #include "main_functions.h"
@@ -16,29 +16,33 @@
 static const char *TAG = "VAD";
 
 /* =========================
-   🔥 UPDATED PARAMETERS
+   PARAMETERS
    ========================= */
 #define VAD_THRESHOLD 10000
 #define VAD_MIN_ENERGY 800
 
-#define SILENCE_FRAMES_END 10
+#define SILENCE_FRAMES_END 20
+#define MIN_SPEECH_FRAMES 20
+#define SPEECH_START_FRAMES 1
 
-#define MIN_SPEECH_FRAMES 20     // ✅ FIX 1
-#define SPEECH_START_FRAMES 1    // ✅ FIX 3
+/* ✅ FIX 2 — Reduced pre-buffer */
+#define PRE_SPEECH_SAMPLES (4000)
 
-#define PRE_SPEECH_FRAMES 20     // ✅ FIX 2 (NEW)
+#define MAX_AUDIO_SAMPLES (16000)
 
 /* =========================
    BUFFERS
    ========================= */
 static int16_t circular_buffer[FRAME_SIZE];
-static float audio_float[FRAME_SIZE];
-static float mfcc[MFCC_COUNT];
 
-/* 🔥 NEW: pre-speech ring buffer */
-static float pre_speech_buffer[PRE_SPEECH_FRAMES][MFCC_COUNT];
+/* RAW AUDIO STORAGE */
+static int16_t pre_buffer[PRE_SPEECH_SAMPLES];
+static int16_t speech_buffer[MAX_AUDIO_SAMPLES];
+
 static int pre_index = 0;
 static int pre_filled = 0;
+
+static int speech_index = 0;
 
 /* ========================= */
 static int initialized = 0;
@@ -76,36 +80,76 @@ int detect_speech(int16_t *buffer){
 }
 
 /* =========================
-   SAVE PRE-SPEECH
+   PRE BUFFER
    ========================= */
-void store_pre_speech(float *mfcc_frame){
-    memcpy(pre_speech_buffer[pre_index], mfcc_frame, sizeof(float)*MFCC_COUNT);
+void store_pre_buffer(int16_t *frame){
+    for(int i = 0; i < HOP_LENGTH; i++){
+        pre_buffer[pre_index] = frame[i];
+        pre_index = (pre_index + 1) % PRE_SPEECH_SAMPLES;
 
-    pre_index = (pre_index + 1) % PRE_SPEECH_FRAMES;
-
-    if(pre_filled < PRE_SPEECH_FRAMES){
-        pre_filled++;
+        if(pre_filled < PRE_SPEECH_SAMPLES){
+            pre_filled++;
+        }
     }
 }
 
-/* =========================
-   FLUSH PRE-SPEECH INTO MAIN BUFFER
-   ========================= */
-void flush_pre_speech(){
+void flush_pre_buffer(){
 
-    int start = (pre_index - pre_filled + PRE_SPEECH_FRAMES) % PRE_SPEECH_FRAMES;
+    int start = (pre_index - pre_filled + PRE_SPEECH_SAMPLES) % PRE_SPEECH_SAMPLES;
 
     for(int i = 0; i < pre_filled; i++){
-        int idx = (start + i) % PRE_SPEECH_FRAMES;
-        loop(pre_speech_buffer[idx]);  // push to model buffer
+        int idx = (start + i) % PRE_SPEECH_SAMPLES;
+
+        if(speech_index < MAX_AUDIO_SAMPLES){
+            speech_buffer[speech_index++] = pre_buffer[idx];
+        }
     }
 
-    ESP_LOGI(TAG, "Injected %d pre-speech frames", pre_filled);
+    ESP_LOGI(TAG, "Injected RAW pre-buffer: %d samples", pre_filled);
 }
 
 /* =========================
-   MAIN
+   🔥 CRITICAL: FULL AUDIO → MFCC → MODEL
    ========================= */
+void process_full_audio(int16_t *audio, int length){
+
+    ESP_LOGI(TAG, "Generating MFCC sequence...");
+
+    float frame[FRAME_SIZE];
+    float mfcc[MFCC_COUNT];
+
+    reset_mfcc_buffer();
+
+    int frame_count = 0;
+
+    /* ✅ FIX 1 — Normalize like training (compute max once) */
+    float max_val = 1e-6f;
+    for(int i = 0; i < length; i++){
+        float v = fabsf(audio[i]);
+        if(v > max_val) max_val = v;
+    }
+
+    for(int i = 0; i < length - FRAME_SIZE; i += HOP_LENGTH){
+
+        /* ✅ Normalize audio */
+        for(int j = 0; j < FRAME_SIZE; j++){
+            frame[j] = audio[i + j] / max_val;
+        }
+
+        mfcc_compute(frame, mfcc);
+
+        loop(mfcc);  // feed model buffer
+
+        frame_count++;
+    }
+
+    ESP_LOGI(TAG, "Total MFCC frames: %d", frame_count);
+
+    // 🔥 RUN INFERENCE
+    run_inference_on_speech();
+}
+
+/* ========================= */
 void app_main(void){
 
     setup();
@@ -114,6 +158,8 @@ void app_main(void){
     while(1){
 
         lv_timer_handler();
+
+        //update_display_if_needed(); 
 
         memmove(circular_buffer,
                 circular_buffer + HOP_LENGTH,
@@ -129,46 +175,27 @@ void app_main(void){
             continue;
         }
 
-        /* =========================
-           ALWAYS COMPUTE MFCC
-           (even before speech)
-           ========================= */
-        float max_val = 0.0f;
-
-        for(int i=0;i<FRAME_SIZE;i++){
-            audio_float[i] = (float)circular_buffer[i] / 32768.0f;
-            if(fabsf(audio_float[i]) > max_val) max_val = fabsf(audio_float[i]);
-        }
-
-        float scale = (max_val>1e-6f)?max_val:1.0f;
-
-        for(int i=0;i<FRAME_SIZE;i++){
-            audio_float[i] /= scale;
-        }
-
-        mfcc_compute(audio_float, mfcc);
-
-        /* =========================
-           STORE PRE-SPEECH ALWAYS
-           ========================= */
-        store_pre_speech(mfcc);
+        store_pre_buffer(circular_buffer);
 
         int speech = detect_speech(circular_buffer);
 
         if(speech){
 
-            /* 🔥 START OF SPEECH */
             if(!speech_active){
                 ESP_LOGI(TAG, "Speech START detected");
 
-                /* ✅ inject buffered frames */
-                flush_pre_speech();
+                speech_index = 0;
+                flush_pre_buffer();
             }
 
             speech_active = 1;
             silence_count = 0;
 
-            loop(mfcc);
+            for(int i = 0; i < HOP_LENGTH; i++){
+                if(speech_index < MAX_AUDIO_SAMPLES){
+                    speech_buffer[speech_index++] = circular_buffer[i];
+                }
+            }
 
         } else {
 
@@ -178,20 +205,18 @@ void app_main(void){
 
                 if(silence_count > SILENCE_FRAMES_END){
 
-                    int frames = get_frame_count();
+                    ESP_LOGI(TAG, "Speech ended. Samples: %d", speech_index);
 
-                    ESP_LOGI(TAG, "Speech ended. Frames captured: %d", frames);
+                    /* ✅ FIX 3 — Minimum speech length */
+                    if(speech_index > 5000){
 
-                    if(frames >= MIN_SPEECH_FRAMES){
-                        ESP_LOGI(TAG, "Running inference...");
-                        run_inference_on_speech();
+                        ESP_LOGI(TAG, "Processing full audio...");
+                        process_full_audio(speech_buffer, speech_index);
+
                     } else {
                         ESP_LOGI(TAG, "Rejected (too short)");
                     }
 
-                    reset_mfcc_buffer();
-
-                    /* reset states */
                     speech_active = 0;
                     silence_count = 0;
                     pre_filled = 0;
