@@ -187,8 +187,6 @@ void app_main(void)
 
     esp_task_wdt_add(NULL);
 
-    display_send_text("Listening...");
-
     while (1)
     {
         display_task(); 
@@ -222,7 +220,7 @@ void app_main(void)
         {
             if (!speech_active) {
                 ESP_LOGI(TAG, "Speech START detected");
-                display_send_text("Recording...");
+                //display_send_text("Recording...");
 
                 speech_index = 0;
                 flush_pre_buffer();
@@ -255,7 +253,7 @@ void app_main(void)
                     if (speech_index > 5000)
                     {
                         state = STATE_PROCESSING;
-                        display_send_text("Processing...");
+                        //display_send_text("Processing...");
 
                         process_full_audio(speech_buffer, speech_index);
 
@@ -266,7 +264,7 @@ void app_main(void)
                     pre_index = 0;
 
                     state = STATE_LISTENING;
-                    display_send_text("Listening...");
+                    //display_send_text("Listening...");
                 }
             }
         }

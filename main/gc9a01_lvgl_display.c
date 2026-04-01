@@ -1,14 +1,10 @@
 #include "gc9a01_lvgl_display.h"
-
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-
 #include "driver/spi_master.h"
-
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_gc9a01.h"
-
 #include "lvgl.h"
 
 static const char *TAG = "DISPLAY";
@@ -27,15 +23,15 @@ static const char *TAG = "DISPLAY";
 #define LCD_H_RES 240
 #define LCD_V_RES 240
 
-/* ========================= */
 static esp_lcd_panel_handle_t panel_handle = NULL;
-static lv_obj_t *label;
+static lv_obj_t *label = NULL;
 
 /* =========================
    LVGL FLUSH
    ========================= */
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
+    // Draw bitmap to panel
     esp_lcd_panel_draw_bitmap(
         panel_handle,
         area->x1,
@@ -44,7 +40,6 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
         area->y2 + 1,
         color_map
     );
-
     lv_disp_flush_ready(drv);
 }
 
@@ -61,13 +56,11 @@ void gc9a01_init(void)
         .quadhd_io_num = -1,
         .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
     };
-
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     ESP_LOGI(TAG, "Init IO");
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
-
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = PIN_NUM_DC,
         .cs_gpio_num = PIN_NUM_CS,
@@ -77,7 +70,6 @@ void gc9a01_init(void)
         .spi_mode = 0,
         .trans_queue_depth = 10,
     };
-
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &io_handle));
 
     ESP_LOGI(TAG, "Init GC9A01 panel");
@@ -87,14 +79,16 @@ void gc9a01_init(void)
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
     };
-
     ESP_ERROR_CHECK(esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
 
     vTaskDelay(pdMS_TO_TICKS(120));
-
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+
+    // ✅ Fix: correct color inversion / mirroring
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, false));    // normal colors
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false)); // horizontal mirror
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, false));         // ensure X/Y not swapped
 
     ESP_LOGI(TAG, "Init LVGL");
 
@@ -102,9 +96,7 @@ void gc9a01_init(void)
 
     static lv_disp_draw_buf_t draw_buf;
     static lv_color_t *buf = NULL;
-
     buf = heap_caps_malloc(LCD_H_RES * 40 * sizeof(lv_color_t), MALLOC_CAP_DMA);
-
     lv_disp_draw_buf_init(&draw_buf, buf, NULL, LCD_H_RES * 40);
 
     static lv_disp_drv_t disp_drv;
@@ -115,28 +107,37 @@ void gc9a01_init(void)
     disp_drv.flush_cb = lvgl_flush_cb;
     disp_drv.draw_buf = &draw_buf;
 
+    disp_drv.sw_rotate = 0;    // no software rotation
+    disp_drv.rotated = 0;      // not mirrored
+    disp_drv.full_refresh = 1; // full redraw to avoid overlapping
+
     lv_disp_drv_register(&disp_drv);
 
     /* =========================
-       UI
+       UI: create main label
        ========================= */
     label = lv_label_create(lv_scr_act());
-    lv_obj_center(label);
-    lv_label_set_text(label, "Listening...");
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);        // center label
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP); // wrap text
+    lv_label_set_text(label, "");  // start empty
 
     ESP_LOGI(TAG, "Display ready");
 }
 
-/* ========================= */
+/* =========================
+   Send text safely
+   ========================= */
 void display_send_text(const char *text)
 {
     if (!label) return;
 
+    // Clear previous text to prevent overlap
+    lv_label_set_text(label, "");
     lv_label_set_text(label, text);
 }
 
 /* =========================
-   CALL PERIODICALLY
+   Call periodically in main loop
    ========================= */
 void display_task(void)
 {
