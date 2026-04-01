@@ -1,0 +1,975 @@
+#### all_code_output.txt ####
+
+
+
+#### audio_i2s.c ####
+
+#include "audio_i2s.h"
+#include "driver/i2s.h"
+#include "freertos/FreeRTOS.h"
+
+#define I2S_NUM I2S_NUM_0
+#define FRAME_SIZE 512
+
+/* =========================
+   STATIC BUFFER
+   ========================= */
+static int32_t raw_buffer[FRAME_SIZE];
+
+void audio_i2s_init(void)
+{
+    i2s_config_t config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S,
+        .intr_alloc_flags = 0,
+        .dma_buf_count = 4,
+        .dma_buf_len = 512,
+        .use_apll = false
+    };
+
+    i2s_pin_config_t pins = {
+        .bck_io_num = 4,   // SCK
+        .ws_io_num = 5,    // WS
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = 6   // SD
+    };
+
+    i2s_driver_install(I2S_NUM, &config, 0, NULL);
+    i2s_set_pin(I2S_NUM, &pins);
+    i2s_zero_dma_buffer(I2S_NUM);
+}
+
+void audio_i2s_read(int16_t *buffer, int samples)
+{
+    size_t bytes_read;
+
+    i2s_read(
+        I2S_NUM,
+        raw_buffer,
+        samples * sizeof(int32_t),
+        &bytes_read,
+        portMAX_DELAY
+    );
+
+    int count = bytes_read / sizeof(int32_t);
+
+    for (int i = 0; i < count; i++)
+    {
+        buffer[i] = raw_buffer[i] >> 8;  // 24-bit → 16-bit
+    }
+}
+
+#### audio_i2s.h ####
+
+#pragma once
+#include <stdint.h>
+
+#define SAMPLE_RATE 16000
+
+void audio_i2s_init(void);
+void audio_i2s_read(int16_t *buffer, int samples);
+
+#### CMakeLists.txt ####
+
+idf_component_register(
+    SRCS
+        "audio_i2s.c"
+        "mfcc.c"
+        "main.c"
+        "main_functions.cc"
+        "constants.cc"
+        "model.cc"
+        "output_handler.cc"
+        "gc9a01_lvgl_display.c"
+    INCLUDE_DIRS "."
+    REQUIRES driver freertos esp-dsp lvgl esp_lcd esp_lcd_gc9a01
+)
+
+set_source_files_properties(
+    main_functions.cc constants.cc model.cc output_handler.cc
+    PROPERTIES COMPILE_FLAGS "-std=c++17"
+)
+
+target_link_libraries(${COMPONENT_LIB} PUBLIC "-lstdc++")
+
+#### constants.cc ####
+
+#include "constants.h"
+
+#### constants.h ####
+
+#ifndef CONSTANTS_H
+#define CONSTANTS_H
+
+// Example: number of inferences per cycle
+const int kInferencesPerCycle = 20;
+
+#endif // CONSTANTS_H
+
+#### gc9a01_lvgl_display.c ####
+
+#include "gc9a01_lvgl_display.h"
+
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+
+#include "driver/spi_master.h"
+
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_gc9a01.h"
+
+#include "lvgl.h"
+
+static const char *TAG = "DISPLAY";
+
+/* =========================
+   PINS (YOUR WORKING ONES)
+   ========================= */
+#define PIN_NUM_SCLK    8
+#define PIN_NUM_MOSI    10
+#define PIN_NUM_MISO    -1
+#define PIN_NUM_DC      2
+#define PIN_NUM_RST     -1
+#define PIN_NUM_CS      7
+
+#define LCD_HOST SPI2_HOST
+#define LCD_H_RES 240
+#define LCD_V_RES 240
+
+/* ========================= */
+static esp_lcd_panel_handle_t panel_handle = NULL;
+static lv_obj_t *label;
+
+/* =========================
+   LVGL FLUSH
+   ========================= */
+static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+{
+    esp_lcd_panel_draw_bitmap(
+        panel_handle,
+        area->x1,
+        area->y1,
+        area->x2 + 1,
+        area->y2 + 1,
+        color_map
+    );
+
+    lv_disp_flush_ready(drv);
+}
+
+/* ========================= */
+void gc9a01_init(void)
+{
+    ESP_LOGI(TAG, "Init SPI");
+
+    spi_bus_config_t buscfg = {
+        .sclk_io_num = PIN_NUM_SCLK,
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
+    };
+
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+    ESP_LOGI(TAG, "Init IO");
+
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = PIN_NUM_DC,
+        .cs_gpio_num = PIN_NUM_CS,
+        .pclk_hz = 10 * 1000 * 1000,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+    };
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &io_handle));
+
+    ESP_LOGI(TAG, "Init GC9A01 panel");
+
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = PIN_NUM_RST,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        .bits_per_pixel = 16,
+    };
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
+
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+
+    ESP_LOGI(TAG, "Init LVGL");
+
+    lv_init();
+
+    static lv_disp_draw_buf_t draw_buf;
+    static lv_color_t *buf = NULL;
+
+    buf = heap_caps_malloc(LCD_H_RES * 40 * sizeof(lv_color_t), MALLOC_CAP_DMA);
+
+    lv_disp_draw_buf_init(&draw_buf, buf, NULL, LCD_H_RES * 40);
+
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+
+    disp_drv.hor_res = LCD_H_RES;
+    disp_drv.ver_res = LCD_V_RES;
+    disp_drv.flush_cb = lvgl_flush_cb;
+    disp_drv.draw_buf = &draw_buf;
+
+    lv_disp_drv_register(&disp_drv);
+
+    /* =========================
+       UI
+       ========================= */
+    label = lv_label_create(lv_scr_act());
+    lv_obj_center(label);
+    lv_label_set_text(label, "Listening...");
+
+    ESP_LOGI(TAG, "Display ready");
+}
+
+/* ========================= */
+void display_send_text(const char *text)
+{
+    if (!label) return;
+
+    lv_label_set_text(label, text);
+}
+
+/* =========================
+   CALL PERIODICALLY
+   ========================= */
+void display_task(void)
+{
+    lv_timer_handler();
+}
+
+#### gc9a01_lvgl_display.h ####
+
+#pragma once
+#include "lvgl.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void gc9a01_init(void);
+void display_send_text(const char *text);
+
+/* 🔥 ADD THIS */
+void display_task(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#### idf_component.yml ####
+
+dependencies:
+  idf:
+    version: ">=5.0"
+
+  espressif/esp-dsp: "*"
+  espressif/esp-tflite-micro: "*"
+
+  # LVGL dependency
+  lvgl/lvgl: ^8.3.11
+
+  esp_lcd_gc9a01: "^1.0"
+
+#### main.c ####
+
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdint.h>
+
+#include "audio_i2s.h"
+#include "mfcc.h"
+#include "main_functions.h"
+#include "gc9a01_lvgl_display.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
+
+#define FRAME_SIZE 512
+#define HOP_LENGTH 160
+
+static const char *TAG = "VAD";
+
+/* =========================
+   SYSTEM STATE MACHINE
+   ========================= */
+typedef enum {
+    STATE_LISTENING,
+    STATE_RECORDING,
+    STATE_PROCESSING
+} system_state_t;
+
+static system_state_t state = STATE_LISTENING;
+
+/* =========================
+   PARAMETERS
+   ========================= */
+#define VAD_THRESHOLD 10000
+#define VAD_MIN_ENERGY 800
+
+#define SILENCE_FRAMES_END 20
+#define SPEECH_START_FRAMES 1
+
+#define PRE_SPEECH_SAMPLES (4000)
+#define MAX_AUDIO_SAMPLES (16000)
+
+/* =========================
+   BUFFERS
+   ========================= */
+static int16_t circular_buffer[FRAME_SIZE];
+static int16_t pre_buffer[PRE_SPEECH_SAMPLES];
+static int16_t speech_buffer[MAX_AUDIO_SAMPLES];
+
+static int pre_index = 0;
+static int pre_filled = 0;
+static int speech_index = 0;
+
+static int initialized = 0;
+static int speech_active = 0;
+static int silence_count = 0;
+
+/* =========================
+   VAD
+   ========================= */
+int detect_speech(int16_t *buffer)
+{
+    long energy = 0;
+
+    for (int i = 0; i < FRAME_SIZE; i++) {
+        energy += abs(buffer[i]);
+    }
+
+    energy /= FRAME_SIZE;
+
+    if (energy < VAD_MIN_ENERGY) {
+        return 0;
+    }
+
+    static int speech_frames = 0;
+
+    if (energy > VAD_THRESHOLD) {
+        speech_frames++;
+    } else {
+        speech_frames = 0;
+    }
+
+    return speech_frames >= SPEECH_START_FRAMES;
+}
+
+/* ========================= */
+void store_pre_buffer(int16_t *frame)
+{
+    for (int i = 0; i < HOP_LENGTH; i++) {
+        pre_buffer[pre_index] = frame[i];
+        pre_index = (pre_index + 1) % PRE_SPEECH_SAMPLES;
+
+        if (pre_filled < PRE_SPEECH_SAMPLES) {
+            pre_filled++;
+        }
+    }
+}
+
+void flush_pre_buffer()
+{
+    int start = (pre_index - pre_filled + PRE_SPEECH_SAMPLES) % PRE_SPEECH_SAMPLES;
+
+    for (int i = 0; i < pre_filled; i++) {
+        int idx = (start + i) % PRE_SPEECH_SAMPLES;
+
+        if (speech_index < MAX_AUDIO_SAMPLES) {
+            speech_buffer[speech_index++] = pre_buffer[idx];
+        }
+    }
+
+    ESP_LOGI(TAG, "Injected RAW pre-buffer: %d samples", pre_filled);
+}
+
+/* ========================= */
+void process_full_audio(int16_t *audio, int length)
+{
+    ESP_LOGI(TAG, "Generating MFCC sequence...");
+
+    float frame[FRAME_SIZE];
+    float mfcc[MFCC_COUNT];
+
+    reset_mfcc_buffer();
+
+    int frame_count = 0;
+    float max_val = 1e-6f;
+
+    for (int i = 0; i < length; i++) {
+        float v = fabsf((float)audio[i]);
+        if (v > max_val) max_val = v;
+    }
+
+    for (int i = 0; i < length - FRAME_SIZE; i += HOP_LENGTH) {
+
+        for (int j = 0; j < FRAME_SIZE; j++) {
+            frame[j] = audio[i + j] / max_val;
+        }
+
+        mfcc_compute(frame, mfcc);
+        loop(mfcc);
+        frame_count++;
+
+        /* ✅ FEED WDT + YIELD */
+        if (i % (HOP_LENGTH * 5) == 0) {
+            esp_task_wdt_reset();
+            taskYIELD();
+        }
+    }
+
+    ESP_LOGI(TAG, "Total MFCC frames: %d", frame_count);
+
+    /* ✅ FEED before heavy inference */
+    esp_task_wdt_reset();
+
+    run_inference_on_speech();
+
+    /* ✅ FEED after inference */
+    esp_task_wdt_reset();
+}
+
+/* ========================= */
+void app_main(void)
+{
+    setup();
+    audio_i2s_init();
+    gc9a01_init();
+
+    /* =========================
+   LVGL Tick Function
+   ========================= */
+    void lvgl_tick_callback(void* arg) {
+        lv_tick_inc(1);
+    }
+
+    /* =========================
+    Timer creation
+    ========================= */
+    const esp_timer_create_args_t lvgl_tick_timer_args = {
+        .callback = lvgl_tick_callback,
+        .name = "lvgl_tick"
+    };
+
+    esp_timer_handle_t lvgl_tick_timer;
+    esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer);
+    esp_timer_start_periodic(lvgl_tick_timer, 1000);
+
+    esp_task_wdt_add(NULL);
+
+    display_send_text("Listening...");
+
+    while (1)
+    {
+        display_task(); 
+        if (state == STATE_PROCESSING) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        /* AUDIO PIPELINE */
+        memmove(
+            circular_buffer,
+            circular_buffer + HOP_LENGTH,
+            (FRAME_SIZE - HOP_LENGTH) * sizeof(int16_t)
+        );
+
+        audio_i2s_read(
+            circular_buffer + (FRAME_SIZE - HOP_LENGTH),
+            HOP_LENGTH
+        );
+
+        if (!initialized) {
+            initialized = 1;
+            continue;
+        }
+
+        store_pre_buffer(circular_buffer);
+
+        int speech = detect_speech(circular_buffer);
+
+        if (speech)
+        {
+            if (!speech_active) {
+                ESP_LOGI(TAG, "Speech START detected");
+                display_send_text("Recording...");
+
+                speech_index = 0;
+                flush_pre_buffer();
+
+                state = STATE_RECORDING;
+            }
+
+            speech_active = 1;
+            silence_count = 0;
+
+            for (int i = 0; i < HOP_LENGTH; i++) {
+                if (speech_index < MAX_AUDIO_SAMPLES) {
+                    speech_buffer[speech_index++] = circular_buffer[i];
+                }
+            }
+        }
+        else
+        {
+            if (speech_active)
+            {
+                silence_count++;
+
+                if (silence_count > SILENCE_FRAMES_END)
+                {
+                    ESP_LOGI(TAG, "Speech ended. Samples: %d", speech_index);
+
+                    speech_active = 0;
+                    silence_count = 0;
+
+                    if (speech_index > 5000)
+                    {
+                        state = STATE_PROCESSING;
+                        display_send_text("Processing...");
+
+                        process_full_audio(speech_buffer, speech_index);
+
+                        update_display_if_needed();
+                    }
+
+                    pre_filled = 0;
+                    pre_index = 0;
+
+                    state = STATE_LISTENING;
+                    display_send_text("Listening...");
+                }
+            }
+        }
+
+        /* ✅ FEED WDT continuously */
+        esp_task_wdt_reset();
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+#### main_functions.cc ####
+
+#include "main_functions.h"
+#include "model.h"
+#include "output_handler.h"
+#include "mfcc.h"
+
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+#include <string.h>
+#include "esp_log.h"
+
+static const char* TAG = "TinyML";
+
+namespace {
+const tflite::Model* model = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* input = nullptr;
+TfLiteTensor* output = nullptr;
+
+constexpr int kTensorArenaSize = 70 * 1024;
+uint8_t tensor_arena[kTensorArenaSize];
+
+float mfcc_buffer[MAX_FRAMES][MFCC_COUNT];
+int frame_index = 0;
+
+volatile int last_prediction = -1;
+volatile bool new_prediction_available = false;
+}
+
+// =========================
+void setup() {
+    model = tflite::GetModel(g_model);
+
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        ESP_LOGE(TAG, "Model schema mismatch!");
+        return;
+    }
+
+    static tflite::MicroMutableOpResolver<10> resolver;
+    resolver.AddConv2D();
+    resolver.AddFullyConnected();
+    resolver.AddMaxPool2D();
+    resolver.AddPack();
+    resolver.AddReshape();
+    resolver.AddShape();
+    resolver.AddSoftmax();
+    resolver.AddStridedSlice();
+
+    static tflite::MicroInterpreter static_interpreter(
+        model, resolver, tensor_arena, kTensorArenaSize);
+
+    interpreter = &static_interpreter;
+
+    if (interpreter->AllocateTensors() != kTfLiteOk) {
+        ESP_LOGE(TAG, "AllocateTensors failed");
+        return;
+    }
+
+    /* ✅ FIX: ASSIGN INPUT / OUTPUT */
+    input = interpreter->input(0);
+    output = interpreter->output(0);
+
+    if (!input || !output) {
+        ESP_LOGE(TAG, "Input/Output tensor NULL!");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Model initialized OK");
+
+    memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
+    frame_index = 0;
+}
+
+// =========================
+void loop(float* mfcc) {
+    if(frame_index < MAX_FRAMES){
+        memcpy(mfcc_buffer[frame_index], mfcc, sizeof(float) * MFCC_COUNT);
+        frame_index++;
+    }
+}
+
+// =========================
+#include "esp_task_wdt.h"
+
+extern "C" void run_inference_on_speech() {
+
+    if(frame_index == 0) return;
+
+    if (!input || !output) {
+        ESP_LOGE(TAG, "Model not ready!");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Frames: %d", frame_index);
+
+    int input_size = input->bytes / sizeof(float);
+    int expected_size = MAX_FRAMES * MFCC_COUNT;
+
+    if (input_size < expected_size) {
+        ESP_LOGE(TAG, "Input tensor too small! %d < %d", input_size, expected_size);
+        return;
+    }
+
+    for(int i = 0; i < MAX_FRAMES; i++) {
+        for(int j = 0; j < MFCC_COUNT; j++) {
+
+            float value = 0.0f;
+
+            if(i < frame_index){
+                value = mfcc_buffer[i][j];
+            }
+
+            int index = i * MFCC_COUNT + j;
+
+            if(index < input_size){
+                input->data.f[index] = value;
+            }
+        }
+    }
+
+    if(interpreter->Invoke() == kTfLiteOk) {
+
+        int count = output->dims->data[1];
+        int max_idx = 0;
+        float max_score = output->data.f[0];
+
+        for(int i = 1; i < count; i++){
+            if(output->data.f[i] > max_score){
+                max_score = output->data.f[i];
+                max_idx = i;
+            }
+        }
+
+        ESP_LOGI(TAG, "Prediction: %s", kLabels[max_idx]);
+
+        last_prediction = max_idx;
+        new_prediction_available = true;
+
+    } else {
+        ESP_LOGE(TAG, "Inference failed");
+    }
+
+    memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
+    frame_index = 0;
+}
+
+// =========================
+extern "C" void reset_mfcc_buffer() {
+    memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
+    frame_index = 0;
+}
+
+extern "C" int get_frame_count() {
+    return frame_index;
+}
+
+extern "C" void display_send_text(const char *text);
+
+extern "C" void update_display_if_needed() {
+
+    if(new_prediction_available){
+        new_prediction_available = false;
+
+        if(last_prediction >= 0){
+            ESP_LOGI(TAG, "Detected label: %s", kLabels[last_prediction]);
+
+            display_send_text(kLabels[last_prediction]);  // ✅ NON-BLOCKING
+        }
+    }
+}
+
+#### main_functions.h ####
+
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void setup();
+void loop(float* mfcc);
+void reset_mfcc_buffer();
+void run_inference_on_speech();
+int get_frame_count();
+void update_display_if_needed();
+
+// LVGL display
+void display_send_text(const char *text);
+
+#ifdef __cplusplus
+}
+#endif
+
+#### mfcc.c ####
+
+#include <math.h>
+#include <string.h>
+#include "mfcc.h"
+#include "esp_dsp.h"
+
+static float fft_buffer[FRAME_SIZE * 2];
+static float power[FRAME_SIZE/2];
+static float mel_energy[MEL_FILTERS];
+
+/* ✅ SMALLER MEMORY VERSION */
+static float mel_filterbank[MEL_FILTERS][FRAME_SIZE/2];
+static float dct_matrix[MFCC_COUNT][MEL_FILTERS];
+
+static int initialized = 0;
+
+/* ========================= */
+static float hz_to_mel(float hz) {
+    return 2595.0f * log10f(1.0f + hz / 700.0f);
+}
+
+static float mel_to_hz(float mel) {
+    return 700.0f * (powf(10.0f, mel / 2595.0f) - 1.0f);
+}
+
+/* =========================
+   ✅ BUILD FILTERBANK ONCE
+   ========================= */
+static void init_mel_filterbank() {
+
+    float mel_min = hz_to_mel(0);
+    float mel_max = hz_to_mel(SAMPLE_RATE / 2);
+
+    float mel_points[MEL_FILTERS + 2];
+    float hz_points[MEL_FILTERS + 2];
+    int bin[MEL_FILTERS + 2];
+
+    for (int i = 0; i < MEL_FILTERS + 2; i++) {
+        mel_points[i] = mel_min + (mel_max - mel_min) * i / (MEL_FILTERS + 1);
+        hz_points[i] = mel_to_hz(mel_points[i]);
+        bin[i] = (int)((FRAME_SIZE + 1) * hz_points[i] / SAMPLE_RATE);
+    }
+
+    memset(mel_filterbank, 0, sizeof(mel_filterbank));
+
+    for (int m = 1; m <= MEL_FILTERS; m++) {
+
+        int f_m_minus = bin[m - 1];
+        int f_m = bin[m];
+        int f_m_plus = bin[m + 1];
+
+        for (int k = f_m_minus; k < f_m && k < FRAME_SIZE/2; k++) {
+            mel_filterbank[m - 1][k] =
+                (float)(k - f_m_minus) / (f_m - f_m_minus);
+        }
+
+        for (int k = f_m; k < f_m_plus && k < FRAME_SIZE/2; k++) {
+            mel_filterbank[m - 1][k] =
+                (float)(f_m_plus - k) / (f_m_plus - f_m);
+        }
+    }
+}
+
+/* ========================= */
+static void init_dct() {
+
+    for (int i = 0; i < MFCC_COUNT; i++) {
+        for (int j = 0; j < MEL_FILTERS; j++) {
+
+            float scale = (i == 0)
+                ? sqrtf(1.0f / MEL_FILTERS)
+                : sqrtf(2.0f / MEL_FILTERS);
+
+            dct_matrix[i][j] =
+                scale * cosf(i * (j + 0.5f) * M_PI / MEL_FILTERS);
+        }
+    }
+}
+
+/* ========================= */
+static void mfcc_init() {
+
+    if (initialized) return;
+
+    init_mel_filterbank();
+    init_dct();
+
+    initialized = 1;
+}
+
+/* ========================= */
+void mfcc_compute(float *input, float *mfcc_out) {
+
+    mfcc_init();
+
+    for (int i = 0; i < FRAME_SIZE; i++) {
+        float window = 0.5f - 0.5f * cosf(2 * M_PI * i / (FRAME_SIZE - 1));
+        fft_buffer[2*i] = input[i] * window;
+        fft_buffer[2*i+1] = 0.0f;
+    }
+
+    dsps_fft2r_fc32(fft_buffer, FRAME_SIZE);
+    dsps_bit_rev_fc32(fft_buffer, FRAME_SIZE);
+    dsps_cplx2reC_fc32(fft_buffer, FRAME_SIZE);
+
+    for (int i = 0; i < FRAME_SIZE/2; i++) {
+        power[i] =
+            (fft_buffer[2*i]*fft_buffer[2*i] +
+             fft_buffer[2*i+1]*fft_buffer[2*i+1]) / FRAME_SIZE;
+    }
+
+    memset(mel_energy, 0, sizeof(mel_energy));
+
+    for (int m = 0; m < MEL_FILTERS; m++) {
+
+        for (int k = 0; k < FRAME_SIZE/2; k++) {
+            mel_energy[m] += power[k] * mel_filterbank[m][k];
+        }
+
+        mel_energy[m] = log10f(mel_energy[m] + 1e-6f);
+    }
+
+    for (int i = 0; i < MFCC_COUNT; i++) {
+
+        mfcc_out[i] = 0;
+
+        for (int j = 0; j < MEL_FILTERS; j++) {
+            mfcc_out[i] += dct_matrix[i][j] * mel_energy[j];
+        }
+    }
+}
+
+#### mfcc.h ####
+
+#pragma once
+
+#define SAMPLE_RATE 16000 
+#define FRAME_SIZE 512
+#define HOP_LENGTH 160
+#define MFCC_COUNT 13
+#define MEL_FILTERS 26
+#define MAX_FRAMES 100
+
+void mfcc_compute(float *audio, float *mfcc_out);
+
+#### model.h ####
+
+#pragma once
+extern const unsigned char g_model[];
+extern const int g_model_len;
+
+#### output_handler.cc ####
+
+#include <stdio.h>
+#include "output_handler.h"
+#include "tensorflow/lite/micro/micro_log.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+const char* kLabels[] = {
+    "yes","no","on","off","up","down","left","right","stop","go"
+};
+
+/* ✅ SAFE: no float formatting */
+void HandleOutput(float* scores, int count) {
+
+    MicroPrintf("Prediction done");
+
+    /* OPTIONAL: print only index */
+    int max_idx = 0;
+    float max_score = scores[0];
+
+    for (int i = 1; i < count; i++) {
+        if (scores[i] > max_score) {
+            max_score = scores[i];
+            max_idx = i;
+        }
+    }
+
+    MicroPrintf("Top index: %d", max_idx);
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#### output_handler.h ####
+
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void HandleOutput(float* scores, int count);
+
+/* ✅ ADD THIS */
+extern const char* kLabels[];
+
+#ifdef __cplusplus
+}
+#endif
+

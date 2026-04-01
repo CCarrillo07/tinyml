@@ -9,7 +9,7 @@ idf_component_register(
         "output_handler.cc"
         "gc9a01_lvgl_display.c"
     INCLUDE_DIRS "."
-    REQUIRES driver freertos esp-dsp lvgl
+    REQUIRES driver freertos esp-dsp lvgl esp_lcd esp_lcd_gc9a01
 )
 
 set_source_files_properties(

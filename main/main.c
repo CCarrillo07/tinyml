@@ -1,19 +1,34 @@
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdint.h>
+
 #include "audio_i2s.h"
 #include "mfcc.h"
 #include "main_functions.h"
-#include <stdio.h>
-#include <stdint.h>
+#include "gc9a01_lvgl_display.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "gc9a01_lvgl_display.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
 
 #define FRAME_SIZE 512
 #define HOP_LENGTH 160
 
 static const char *TAG = "VAD";
+
+/* =========================
+   SYSTEM STATE MACHINE
+   ========================= */
+typedef enum {
+    STATE_LISTENING,
+    STATE_RECORDING,
+    STATE_PROCESSING
+} system_state_t;
+
+static system_state_t state = STATE_LISTENING;
 
 /* =========================
    PARAMETERS
@@ -22,7 +37,6 @@ static const char *TAG = "VAD";
 #define VAD_MIN_ENERGY 800
 
 #define SILENCE_FRAMES_END 20
-#define MIN_SPEECH_FRAMES 20
 #define SPEECH_START_FRAMES 1
 
 #define PRE_SPEECH_SAMPLES (4000)
@@ -46,25 +60,23 @@ static int silence_count = 0;
 /* =========================
    VAD
    ========================= */
-int detect_speech(int16_t *buffer){
-
+int detect_speech(int16_t *buffer)
+{
     long energy = 0;
-    for(int i = 0; i < FRAME_SIZE; i++){
+
+    for (int i = 0; i < FRAME_SIZE; i++) {
         energy += abs(buffer[i]);
     }
+
     energy /= FRAME_SIZE;
 
-    if(energy > VAD_THRESHOLD){
-        ESP_LOGI(TAG, "Energy above threshold: %ld", energy);
-    }
-
-    if(energy < VAD_MIN_ENERGY){
+    if (energy < VAD_MIN_ENERGY) {
         return 0;
     }
 
     static int speech_frames = 0;
 
-    if(energy > VAD_THRESHOLD){
+    if (energy > VAD_THRESHOLD) {
         speech_frames++;
     } else {
         speech_frames = 0;
@@ -74,24 +86,26 @@ int detect_speech(int16_t *buffer){
 }
 
 /* ========================= */
-void store_pre_buffer(int16_t *frame){
-    for (int i = 0; i < HOP_LENGTH; i++){
+void store_pre_buffer(int16_t *frame)
+{
+    for (int i = 0; i < HOP_LENGTH; i++) {
         pre_buffer[pre_index] = frame[i];
         pre_index = (pre_index + 1) % PRE_SPEECH_SAMPLES;
 
-        if(pre_filled < PRE_SPEECH_SAMPLES){
+        if (pre_filled < PRE_SPEECH_SAMPLES) {
             pre_filled++;
         }
     }
 }
 
-void flush_pre_buffer(){
+void flush_pre_buffer()
+{
     int start = (pre_index - pre_filled + PRE_SPEECH_SAMPLES) % PRE_SPEECH_SAMPLES;
 
-    for(int i = 0; i < pre_filled; i++){
+    for (int i = 0; i < pre_filled; i++) {
         int idx = (start + i) % PRE_SPEECH_SAMPLES;
 
-        if(speech_index < MAX_AUDIO_SAMPLES){
+        if (speech_index < MAX_AUDIO_SAMPLES) {
             speech_buffer[speech_index++] = pre_buffer[idx];
         }
     }
@@ -100,8 +114,8 @@ void flush_pre_buffer(){
 }
 
 /* ========================= */
-void process_full_audio(int16_t *audio, int length){
-
+void process_full_audio(int16_t *audio, int length)
+{
     ESP_LOGI(TAG, "Generating MFCC sequence...");
 
     float frame[FRAME_SIZE];
@@ -111,48 +125,91 @@ void process_full_audio(int16_t *audio, int length){
 
     int frame_count = 0;
     float max_val = 1e-6f;
-    for(int i = 0; i < length; i++){
+
+    for (int i = 0; i < length; i++) {
         float v = fabsf((float)audio[i]);
-        if(v > max_val) max_val = v;
+        if (v > max_val) max_val = v;
     }
 
-    for(int i = 0; i < length - FRAME_SIZE; i += HOP_LENGTH){
+    for (int i = 0; i < length - FRAME_SIZE; i += HOP_LENGTH) {
 
-        for(int j = 0; j < FRAME_SIZE; j++){
+        for (int j = 0; j < FRAME_SIZE; j++) {
             frame[j] = audio[i + j] / max_val;
         }
 
         mfcc_compute(frame, mfcc);
         loop(mfcc);
         frame_count++;
+
+        /* ✅ FEED WDT + YIELD */
+        if (i % (HOP_LENGTH * 5) == 0) {
+            esp_task_wdt_reset();
+            taskYIELD();
+        }
     }
 
     ESP_LOGI(TAG, "Total MFCC frames: %d", frame_count);
 
+    /* ✅ FEED before heavy inference */
+    esp_task_wdt_reset();
+
     run_inference_on_speech();
+
+    /* ✅ FEED after inference */
+    esp_task_wdt_reset();
 }
 
 /* ========================= */
-void app_main(void){
-
+void app_main(void)
+{
     setup();
     audio_i2s_init();
-    gc9a01_init(); 
+    gc9a01_init();
 
-    static int display_counter = 0;
+    /* =========================
+   LVGL Tick Function
+   ========================= */
+    void lvgl_tick_callback(void* arg) {
+        lv_tick_inc(1);
+    }
 
-    while(1){
+    /* =========================
+    Timer creation
+    ========================= */
+    const esp_timer_create_args_t lvgl_tick_timer_args = {
+        .callback = lvgl_tick_callback,
+        .name = "lvgl_tick"
+    };
 
-        memmove(circular_buffer,
-                circular_buffer + HOP_LENGTH,
-                (FRAME_SIZE - HOP_LENGTH) * sizeof(int16_t));
+    esp_timer_handle_t lvgl_tick_timer;
+    esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer);
+    esp_timer_start_periodic(lvgl_tick_timer, 1000);
+
+    esp_task_wdt_add(NULL);
+
+    display_send_text("Listening...");
+
+    while (1)
+    {
+        display_task(); 
+        if (state == STATE_PROCESSING) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        /* AUDIO PIPELINE */
+        memmove(
+            circular_buffer,
+            circular_buffer + HOP_LENGTH,
+            (FRAME_SIZE - HOP_LENGTH) * sizeof(int16_t)
+        );
 
         audio_i2s_read(
             circular_buffer + (FRAME_SIZE - HOP_LENGTH),
             HOP_LENGTH
         );
 
-        if(!initialized){
+        if (!initialized) {
             initialized = 1;
             continue;
         }
@@ -161,47 +218,62 @@ void app_main(void){
 
         int speech = detect_speech(circular_buffer);
 
-        if(speech){
-
-            if(!speech_active){
+        if (speech)
+        {
+            if (!speech_active) {
                 ESP_LOGI(TAG, "Speech START detected");
+                display_send_text("Recording...");
 
                 speech_index = 0;
                 flush_pre_buffer();
+
+                state = STATE_RECORDING;
             }
 
             speech_active = 1;
             silence_count = 0;
 
-            for(int i = 0; i < HOP_LENGTH; i++){
-                if(speech_index < MAX_AUDIO_SAMPLES){
+            for (int i = 0; i < HOP_LENGTH; i++) {
+                if (speech_index < MAX_AUDIO_SAMPLES) {
                     speech_buffer[speech_index++] = circular_buffer[i];
                 }
             }
-
-        } else {
-
-            if(speech_active){
-
+        }
+        else
+        {
+            if (speech_active)
+            {
                 silence_count++;
 
-                if(silence_count > SILENCE_FRAMES_END){
-
+                if (silence_count > SILENCE_FRAMES_END)
+                {
                     ESP_LOGI(TAG, "Speech ended. Samples: %d", speech_index);
-
-                    if(speech_index > 5000){
-                        ESP_LOGI(TAG, "Processing full audio...");
-                        process_full_audio(speech_buffer, speech_index);
-                    }
 
                     speech_active = 0;
                     silence_count = 0;
+
+                    if (speech_index > 5000)
+                    {
+                        state = STATE_PROCESSING;
+                        display_send_text("Processing...");
+
+                        process_full_audio(speech_buffer, speech_index);
+
+                        update_display_if_needed();
+                    }
+
                     pre_filled = 0;
                     pre_index = 0;
+
+                    state = STATE_LISTENING;
+                    display_send_text("Listening...");
                 }
             }
         }
-        update_display_if_needed();
+
+        /* ✅ FEED WDT continuously */
+        esp_task_wdt_reset();
+
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }

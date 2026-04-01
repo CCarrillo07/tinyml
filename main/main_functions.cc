@@ -81,6 +81,8 @@ void loop(float* mfcc) {
 }
 
 // =========================
+#include "esp_task_wdt.h"
+
 extern "C" void run_inference_on_speech() {
 
     if(frame_index == 0) return;
@@ -100,7 +102,6 @@ extern "C" void run_inference_on_speech() {
         return;
     }
 
-    /* ✅ SAFE FILL */
     for(int i = 0; i < MAX_FRAMES; i++) {
         for(int j = 0; j < MFCC_COUNT; j++) {
 
@@ -135,6 +136,7 @@ extern "C" void run_inference_on_speech() {
 
         last_prediction = max_idx;
         new_prediction_available = true;
+
     } else {
         ESP_LOGE(TAG, "Inference failed");
     }
