@@ -10,36 +10,32 @@
 #include <string.h>
 #include "esp_log.h"
 
-#include "gc9a01_lvgl.h"
-#include "lvgl.h"
-
 static const char* TAG = "TinyML";
 
 namespace {
-
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 TfLiteTensor* output = nullptr;
 
-/* ✅ Slightly larger arena (safe) */
 constexpr int kTensorArenaSize = 70 * 1024;
 uint8_t tensor_arena[kTensorArenaSize];
 
-/* ✅ MFCC buffer */
 float mfcc_buffer[MAX_FRAMES][MFCC_COUNT];
 int frame_index = 0;
 
-/* ✅ NEW: prediction buffer (UI-safe) */
 volatile int last_prediction = -1;
 volatile bool new_prediction_available = false;
-
 }
 
 // =========================
 void setup() {
-
     model = tflite::GetModel(g_model);
+
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        ESP_LOGE(TAG, "Model schema mismatch!");
+        return;
+    }
 
     static tflite::MicroMutableOpResolver<10> resolver;
     resolver.AddConv2D();
@@ -55,22 +51,29 @@ void setup() {
         model, resolver, tensor_arena, kTensorArenaSize);
 
     interpreter = &static_interpreter;
-    interpreter->AllocateTensors();
 
+    if (interpreter->AllocateTensors() != kTfLiteOk) {
+        ESP_LOGE(TAG, "AllocateTensors failed");
+        return;
+    }
+
+    /* ✅ FIX: ASSIGN INPUT / OUTPUT */
     input = interpreter->input(0);
     output = interpreter->output(0);
 
+    if (!input || !output) {
+        ESP_LOGE(TAG, "Input/Output tensor NULL!");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Model initialized OK");
+
     memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
     frame_index = 0;
-
-    lcd_lvgl_init();
-    // 🔥 DEBUG: force text
-    display_big_label("HELLO");
 }
 
 // =========================
 void loop(float* mfcc) {
-
     if(frame_index < MAX_FRAMES){
         memcpy(mfcc_buffer[frame_index], mfcc, sizeof(float) * MFCC_COUNT);
         frame_index++;
@@ -82,31 +85,42 @@ extern "C" void run_inference_on_speech() {
 
     if(frame_index == 0) return;
 
+    if (!input || !output) {
+        ESP_LOGE(TAG, "Model not ready!");
+        return;
+    }
+
     ESP_LOGI(TAG, "Frames: %d", frame_index);
 
-    int offset = 0;
+    int input_size = input->bytes / sizeof(float);
+    int expected_size = MAX_FRAMES * MFCC_COUNT;
 
+    if (input_size < expected_size) {
+        ESP_LOGE(TAG, "Input tensor too small! %d < %d", input_size, expected_size);
+        return;
+    }
+
+    /* ✅ SAFE FILL */
     for(int i = 0; i < MAX_FRAMES; i++) {
-
         for(int j = 0; j < MFCC_COUNT; j++) {
 
             float value = 0.0f;
 
-            int src_index = i;
-
-            if(src_index >= 0 && src_index < frame_index){
-                value = mfcc_buffer[src_index][j];
+            if(i < frame_index){
+                value = mfcc_buffer[i][j];
             }
 
             int index = i * MFCC_COUNT + j;
-            input->data.f[index] = value;
+
+            if(index < input_size){
+                input->data.f[index] = value;
+            }
         }
     }
 
     if(interpreter->Invoke() == kTfLiteOk) {
 
         int count = output->dims->data[1];
-
         int max_idx = 0;
         float max_score = output->data.f[0];
 
@@ -119,9 +133,10 @@ extern "C" void run_inference_on_speech() {
 
         ESP_LOGI(TAG, "Prediction: %s", kLabels[max_idx]);
 
-        /* ✅ DO NOT CALL LVGL HERE */
         last_prediction = max_idx;
         new_prediction_available = true;
+    } else {
+        ESP_LOGE(TAG, "Inference failed");
     }
 
     memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
@@ -138,17 +153,17 @@ extern "C" int get_frame_count() {
     return frame_index;
 }
 
-/* =========================
-   ✅ NEW: SAFE UI UPDATE FUNCTION
-   ========================= */
+extern "C" void display_send_text(const char *text);
+
 extern "C" void update_display_if_needed() {
 
     if(new_prediction_available){
-
         new_prediction_available = false;
 
         if(last_prediction >= 0){
-            display_big_label(kLabels[last_prediction]);
+            ESP_LOGI(TAG, "Detected label: %s", kLabels[last_prediction]);
+
+            display_send_text(kLabels[last_prediction]);  // ✅ NON-BLOCKING
         }
     }
 }

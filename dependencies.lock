@@ -49,6 +49,6 @@ direct_dependencies:
 - espressif/esp-tflite-micro
 - idf
 - lvgl/lvgl
-manifest_hash: 383c8dbe87442155f6aeaa8ebfa9a5eca9ef83ae92ad3197725455a93db33ab6
-target: esp32
+manifest_hash: 3491f5f3d332085925efdcf2a064702ecae1abc3163b4592d439c0cd649cbbf5
+target: esp32c3
 version: 2.0.0

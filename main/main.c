@@ -7,8 +7,8 @@
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "lvgl.h"
 #include "esp_log.h"
+#include "gc9a01_lvgl_display.h"
 
 #define FRAME_SIZE 512
 #define HOP_LENGTH 160
@@ -25,26 +25,20 @@ static const char *TAG = "VAD";
 #define MIN_SPEECH_FRAMES 20
 #define SPEECH_START_FRAMES 1
 
-/* ✅ FIX 2 — Reduced pre-buffer */
 #define PRE_SPEECH_SAMPLES (4000)
-
 #define MAX_AUDIO_SAMPLES (16000)
 
 /* =========================
    BUFFERS
    ========================= */
 static int16_t circular_buffer[FRAME_SIZE];
-
-/* RAW AUDIO STORAGE */
 static int16_t pre_buffer[PRE_SPEECH_SAMPLES];
 static int16_t speech_buffer[MAX_AUDIO_SAMPLES];
 
 static int pre_index = 0;
 static int pre_filled = 0;
-
 static int speech_index = 0;
 
-/* ========================= */
 static int initialized = 0;
 static int speech_active = 0;
 static int silence_count = 0;
@@ -79,11 +73,9 @@ int detect_speech(int16_t *buffer){
     return speech_frames >= SPEECH_START_FRAMES;
 }
 
-/* =========================
-   PRE BUFFER
-   ========================= */
+/* ========================= */
 void store_pre_buffer(int16_t *frame){
-    for(int i = 0; i < HOP_LENGTH; i++){
+    for (int i = 0; i < HOP_LENGTH; i++){
         pre_buffer[pre_index] = frame[i];
         pre_index = (pre_index + 1) % PRE_SPEECH_SAMPLES;
 
@@ -94,7 +86,6 @@ void store_pre_buffer(int16_t *frame){
 }
 
 void flush_pre_buffer(){
-
     int start = (pre_index - pre_filled + PRE_SPEECH_SAMPLES) % PRE_SPEECH_SAMPLES;
 
     for(int i = 0; i < pre_filled; i++){
@@ -108,9 +99,7 @@ void flush_pre_buffer(){
     ESP_LOGI(TAG, "Injected RAW pre-buffer: %d samples", pre_filled);
 }
 
-/* =========================
-   🔥 CRITICAL: FULL AUDIO → MFCC → MODEL
-   ========================= */
+/* ========================= */
 void process_full_audio(int16_t *audio, int length){
 
     ESP_LOGI(TAG, "Generating MFCC sequence...");
@@ -121,31 +110,25 @@ void process_full_audio(int16_t *audio, int length){
     reset_mfcc_buffer();
 
     int frame_count = 0;
-
-    /* ✅ FIX 1 — Normalize like training (compute max once) */
     float max_val = 1e-6f;
     for(int i = 0; i < length; i++){
-        float v = fabsf(audio[i]);
+        float v = fabsf((float)audio[i]);
         if(v > max_val) max_val = v;
     }
 
     for(int i = 0; i < length - FRAME_SIZE; i += HOP_LENGTH){
 
-        /* ✅ Normalize audio */
         for(int j = 0; j < FRAME_SIZE; j++){
             frame[j] = audio[i + j] / max_val;
         }
 
         mfcc_compute(frame, mfcc);
-
-        loop(mfcc);  // feed model buffer
-
+        loop(mfcc);
         frame_count++;
     }
 
     ESP_LOGI(TAG, "Total MFCC frames: %d", frame_count);
 
-    // 🔥 RUN INFERENCE
     run_inference_on_speech();
 }
 
@@ -154,12 +137,11 @@ void app_main(void){
 
     setup();
     audio_i2s_init();
+    gc9a01_init(); 
+
+    static int display_counter = 0;
 
     while(1){
-
-        lv_timer_handler();
-
-        //update_display_if_needed(); 
 
         memmove(circular_buffer,
                 circular_buffer + HOP_LENGTH,
@@ -207,14 +189,9 @@ void app_main(void){
 
                     ESP_LOGI(TAG, "Speech ended. Samples: %d", speech_index);
 
-                    /* ✅ FIX 3 — Minimum speech length */
                     if(speech_index > 5000){
-
                         ESP_LOGI(TAG, "Processing full audio...");
                         process_full_audio(speech_buffer, speech_index);
-
-                    } else {
-                        ESP_LOGI(TAG, "Rejected (too short)");
                     }
 
                     speech_active = 0;
@@ -224,7 +201,7 @@ void app_main(void){
                 }
             }
         }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
+        update_display_if_needed();
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }

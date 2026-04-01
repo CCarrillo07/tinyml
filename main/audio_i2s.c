@@ -6,7 +6,7 @@
 #define FRAME_SIZE 512
 
 /* =========================
-   ✅ FIX — MOVE BUFFER TO STATIC (NO STACK OVERFLOW)
+   STATIC BUFFER
    ========================= */
 static int32_t raw_buffer[FRAME_SIZE];
 
@@ -25,10 +25,10 @@ void audio_i2s_init(void)
     };
 
     i2s_pin_config_t pins = {
-        .bck_io_num = 4,
-        .ws_io_num = 5,
+        .bck_io_num = 4,   // SCK
+        .ws_io_num = 5,    // WS
         .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = 6
+        .data_in_num = 6   // SD
     };
 
     i2s_driver_install(I2S_NUM, &config, 0, NULL);
@@ -52,6 +52,6 @@ void audio_i2s_read(int16_t *buffer, int samples)
 
     for (int i = 0; i < count; i++)
     {
-        buffer[i] = raw_buffer[i] >> 8;
+        buffer[i] = raw_buffer[i] >> 8;  // 24-bit → 16-bit
     }
 }
