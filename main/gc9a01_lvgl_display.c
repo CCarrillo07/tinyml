@@ -2,10 +2,12 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/spi_master.h"
+#include "driver/gpio.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_gc9a01.h"
 #include "lvgl.h"
+
 
 static const char *TAG = "DISPLAY";
 
@@ -16,7 +18,7 @@ static const char *TAG = "DISPLAY";
 #define PIN_NUM_MOSI    10
 #define PIN_NUM_MISO    -1
 #define PIN_NUM_DC      2
-#define PIN_NUM_RST     -1
+#define PIN_NUM_RST     3   // <-- Set a real GPIO pin for RST
 #define PIN_NUM_CS      7
 
 #define LCD_HOST SPI2_HOST
@@ -31,7 +33,6 @@ static lv_obj_t *label = NULL;
    ========================= */
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
-    // Draw bitmap to panel
     esp_lcd_panel_draw_bitmap(
         panel_handle,
         area->x1,
@@ -74,21 +75,31 @@ void gc9a01_init(void)
 
     ESP_LOGI(TAG, "Init GC9A01 panel");
 
+    // Setup RST pin if defined
+    if (PIN_NUM_RST >= 0) {
+        gpio_reset_pin(PIN_NUM_RST);
+        gpio_set_direction(PIN_NUM_RST, GPIO_MODE_OUTPUT);
+        // Hardware reset sequence
+        gpio_set_level(PIN_NUM_RST, 0);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        gpio_set_level(PIN_NUM_RST, 1);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = PIN_NUM_RST,
+        .reset_gpio_num = (PIN_NUM_RST >= 0) ? PIN_NUM_RST : -1,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
 
-    vTaskDelay(pdMS_TO_TICKS(120));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
 
-    // ✅ Fix: correct color inversion / mirroring
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, false));    // normal colors
+    // Fix: correct color inversion / mirroring
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, false));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false)); // horizontal mirror
-    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, false));         // ensure X/Y not swapped
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, false));
 
     ESP_LOGI(TAG, "Init LVGL");
 
@@ -106,20 +117,30 @@ void gc9a01_init(void)
     disp_drv.ver_res = LCD_V_RES;
     disp_drv.flush_cb = lvgl_flush_cb;
     disp_drv.draw_buf = &draw_buf;
-
-    disp_drv.sw_rotate = 0;    // no software rotation
-    disp_drv.rotated = 0;      // not mirrored
-    disp_drv.full_refresh = 1; // full redraw to avoid overlapping
+    disp_drv.sw_rotate = 0;
+    disp_drv.rotated = 0;
+    disp_drv.full_refresh = 1;
 
     lv_disp_drv_register(&disp_drv);
 
     /* =========================
        UI: create main label
        ========================= */
-    label = lv_label_create(lv_scr_act());
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);        // center label
-    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP); // wrap text
-    lv_label_set_text(label, "");  // start empty
+    lv_obj_t *scr = lv_scr_act();
+
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    label = lv_label_create(scr);
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(label, "");
+
+    static lv_style_t style;
+    lv_style_init(&style);
+    lv_style_set_text_color(&style, lv_color_white());
+    lv_style_set_text_font(&style, &lv_font_montserrat_40);
+    lv_obj_add_style(label, &style, 0);
 
     ESP_LOGI(TAG, "Display ready");
 }
@@ -130,9 +151,6 @@ void gc9a01_init(void)
 void display_send_text(const char *text)
 {
     if (!label) return;
-
-    // Clear previous text to prevent overlap
-    lv_label_set_text(label, "");
     lv_label_set_text(label, text);
 }
 
