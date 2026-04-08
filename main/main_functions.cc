@@ -9,6 +9,7 @@
 
 #include <string.h>
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 
 static const char* TAG = "TinyML";
 
@@ -57,7 +58,6 @@ void setup() {
         return;
     }
 
-    /* ✅ FIX: ASSIGN INPUT / OUTPUT */
     input = interpreter->input(0);
     output = interpreter->output(0);
 
@@ -74,18 +74,16 @@ void setup() {
 
 // =========================
 void loop(float* mfcc) {
-    if(frame_index < MAX_FRAMES){
+    if (frame_index < MAX_FRAMES) {
         memcpy(mfcc_buffer[frame_index], mfcc, sizeof(float) * MFCC_COUNT);
         frame_index++;
     }
 }
 
 // =========================
-#include "esp_task_wdt.h"
-
 extern "C" void run_inference_on_speech() {
 
-    if(frame_index == 0) return;
+    if (frame_index == 0) return;
 
     if (!input || !output) {
         ESP_LOGE(TAG, "Model not ready!");
@@ -102,37 +100,42 @@ extern "C" void run_inference_on_speech() {
         return;
     }
 
-    for(int i = 0; i < MAX_FRAMES; i++) {
-        for(int j = 0; j < MFCC_COUNT; j++) {
-
+    for (int i = 0; i < MAX_FRAMES; i++) {
+        for (int j = 0; j < MFCC_COUNT; j++) {
             float value = 0.0f;
 
-            if(i < frame_index){
+            if (i < frame_index) {
                 value = mfcc_buffer[i][j];
             }
 
             int index = i * MFCC_COUNT + j;
 
-            if(index < input_size){
+            if (index < input_size) {
                 input->data.f[index] = value;
             }
         }
     }
 
-    if(interpreter->Invoke() == kTfLiteOk) {
+    if (interpreter->Invoke() == kTfLiteOk) {
 
         int count = output->dims->data[1];
         int max_idx = 0;
         float max_score = output->data.f[0];
 
-        for(int i = 1; i < count; i++){
-            if(output->data.f[i] > max_score){
+        ESP_LOGI(TAG, "---- SCORES ----");
+
+        for (int i = 0; i < count; i++) {
+            int scaled_score = (int)(output->data.f[i] * 1000000.0f);
+            ESP_LOGI(TAG, "[%d] %s = %d", i, kLabels[i], scaled_score);
+
+            if (output->data.f[i] > max_score) {
                 max_score = output->data.f[i];
                 max_idx = i;
             }
         }
 
-        ESP_LOGI(TAG, "Prediction: %s", kLabels[max_idx]);
+        int top_scaled_score = (int)(max_score * 1000000.0f);
+        ESP_LOGI(TAG, "Top prediction: %s (score=%d)", kLabels[max_idx], top_scaled_score);
 
         last_prediction = max_idx;
         new_prediction_available = true;
@@ -159,13 +162,12 @@ extern "C" void display_send_text(const char *text);
 
 extern "C" void update_display_if_needed() {
 
-    if(new_prediction_available){
+    if (new_prediction_available) {
         new_prediction_available = false;
 
-        if(last_prediction >= 0){
+        if (last_prediction >= 0) {
             ESP_LOGI(TAG, "Detected label: %s", kLabels[last_prediction]);
-
-            display_send_text(kLabels[last_prediction]);  // ✅ NON-BLOCKING
+            display_send_text(kLabels[last_prediction]);1
         }
     }
 }
